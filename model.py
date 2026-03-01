@@ -70,6 +70,41 @@ def focal_loss_multiclass(
     return loss
 
 
+def dice_loss_multiclass(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    eps: float = 1.0,
+    ignore_index: Optional[int] = None,
+) -> torch.Tensor:
+    """
+    Multi-class Dice loss that averages only over classes present in targets.
+    This is robust to severe class imbalance.
+    """
+    if logits.numel() == 0:
+        return torch.tensor(0.0, device=logits.device)
+
+    if ignore_index is not None:
+        valid = targets != ignore_index
+        logits = logits[valid]
+        targets = targets[valid]
+        if logits.numel() == 0:
+            return torch.tensor(0.0, device=logits.device)
+
+    num_classes = logits.size(-1)
+    probs = F.softmax(logits, dim=-1)
+    one_hot = F.one_hot(targets.long(), num_classes=num_classes).to(dtype=probs.dtype)
+
+    inter = (probs * one_hot).sum(dim=0)
+    denom = probs.sum(dim=0) + one_hot.sum(dim=0)
+    dice = (2.0 * inter + eps) / (denom + eps)
+
+    present = one_hot.sum(dim=0) > 0
+    if present.any():
+        return 1.0 - dice[present].mean()
+    return torch.tensor(0.0, device=logits.device)
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization (more efficient than LayerNorm)"""
     
@@ -453,6 +488,94 @@ class CompositeEmbedding(nn.Module):
         return combined
 
 
+class MixtureDensityHead(nn.Module):
+    """
+    Mixture of Logistics head for multi-modal TOTAL distribution.
+    """
+
+    def __init__(self, n_embd: int, n_components: int, min_value: float, max_value: float):
+        super().__init__()
+        self.n_components = int(n_components)
+        self.min_value = float(min_value)
+        self.max_value = float(max_value)
+
+        self.proj = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.GELU(),
+            nn.LayerNorm(n_embd),
+            nn.Linear(n_embd, self.n_components * 3),
+        )
+
+    def reset_mdn_bias(self):
+        """
+        Initialize MDN output layer:
+        - pi logits: uniform (bias=0)
+        - mu: spread across [min, max] via inverse-sigmoid
+        - log_sigma: moderately wide (~exp(2)=7.4)
+        """
+        last = self.proj[-1]
+        nn.init.zeros_(last.weight)
+        with torch.no_grad():
+            last.bias.zero_()
+            k = self.n_components
+            if k > 1:
+                grid = torch.linspace(0.05, 0.95, steps=k, device=last.bias.device)
+            else:
+                grid = torch.tensor([0.5], device=last.bias.device)
+            mu_bias = torch.logit(grid, eps=1e-6)
+            last.bias[k:2 * k].copy_(mu_bias)
+            last.bias[2 * k:3 * k].fill_(2.0)
+
+    def forward(self, x: torch.Tensor):
+        params = self.proj(x)  # (B, T, 3K)
+        k = self.n_components
+        pi_logits, mu_raw, log_s = params.split(k, dim=-1)
+
+        # Keep means in valid TOTAL range
+        mu = torch.sigmoid(mu_raw) * (self.max_value - self.min_value) + self.min_value
+        # Prevent degenerate ultra-narrow components
+        log_s = torch.clamp(log_s, min=-1.0, max=5.0)
+        # Backward-compatible point estimate
+        pi = F.softmax(pi_logits, dim=-1)
+        mean = (pi * mu).sum(dim=-1)
+        return {
+            'pi_logits': pi_logits,
+            'mu': mu,
+            'log_s': log_s,
+            'mean': mean,
+        }
+
+
+class HierarchicalShiftHead(nn.Module):
+    """
+    Two-stage shift head:
+    1) binary change detection (maintain vs changed)
+    2) 3-class shift classification
+    """
+
+    def __init__(self, n_embd: int, shift_vocab_size: int, dropout: float):
+        super().__init__()
+        hidden = max(n_embd // 2, 32)
+        self.shift_head = nn.Sequential(
+            nn.Linear(n_embd, n_embd),
+            nn.GELU(),
+            nn.LayerNorm(n_embd),
+            nn.Dropout(dropout),
+            nn.Linear(n_embd, shift_vocab_size),
+        )
+        self.change_head = nn.Sequential(
+            nn.Linear(n_embd, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, 2),
+        )
+
+    def forward(self, x: torch.Tensor):
+        shift_logits = self.shift_head(x)
+        change_logits = self.change_head(x)
+        return shift_logits, change_logits
+
+
 class MultiHeadOutput(nn.Module):
     """
     Multi-Head Output Layer: 각 필드별 예측 헤드
@@ -472,6 +595,9 @@ class MultiHeadOutput(nn.Module):
         super().__init__()
         self.n_embd = config.n_embd
         self.time_distribution = getattr(config, 'time_distribution', 'exponential')
+        self.mdn_n_components = int(getattr(config, 'mdn_n_components', 8))
+        self.total_min_value = float(getattr(config, 'total_min_value', 0.0))
+        self.total_max_value = float(getattr(config, 'total_max_value', 550.0))
         
         # Drug-conditioning option
         self.use_drug_conditioning = getattr(config, 'use_drug_conditioning', False)
@@ -479,21 +605,19 @@ class MultiHeadOutput(nn.Module):
         # Classification Heads (DATA, SHIFT)
         self.data_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
         
-        # Strengthened SHIFT Head: 2-layer MLP + LayerNorm for better classification
-        # This gives the model more capacity to learn SHIFT patterns
-        self.shift_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
-            nn.GELU(),
-            nn.LayerNorm(config.n_embd),
-            nn.Linear(config.n_embd, config.shift_vocab_size)
+        # Hierarchical SHIFT head: change detection + 3-class shift
+        self.shift_head = HierarchicalShiftHead(
+            n_embd=config.n_embd,
+            shift_vocab_size=config.shift_vocab_size,
+            dropout=float(getattr(config, 'dropout', 0.1)),
         )
-        
-        # Regression Head (TOTAL) - 2-layer MLP + LayerNorm for better regression
-        self.total_head = nn.Sequential(
-            nn.Linear(config.n_embd, config.n_embd),
-            nn.GELU(),
-            nn.LayerNorm(config.n_embd),
-            nn.Linear(config.n_embd, 1)
+
+        # TOTAL head: MDN (Mixture of Logistics)
+        self.total_head = MixtureDensityHead(
+            n_embd=config.n_embd,
+            n_components=self.mdn_n_components,
+            min_value=self.total_min_value,
+            max_value=self.total_max_value,
         )
         
         # ============================================================
@@ -508,10 +632,10 @@ class MultiHeadOutput(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.n_embd, config.n_embd * 2)  # gamma, beta
             )
-            self.shift_drug_cond_head = nn.Sequential(
-                nn.Linear(config.n_embd, config.n_embd // 2),
-                nn.GELU(),
-                nn.Linear(config.n_embd // 2, config.shift_vocab_size)
+            self.shift_drug_cond_head = HierarchicalShiftHead(
+                n_embd=config.n_embd,
+                shift_vocab_size=config.shift_vocab_size,
+                dropout=float(getattr(config, 'dropout', 0.1)),
             )
             
             # TOTAL: drug 조건만
@@ -520,10 +644,11 @@ class MultiHeadOutput(nn.Module):
                 nn.GELU(),
                 nn.Linear(config.n_embd, config.n_embd * 2)  # gamma, beta
             )
-            self.total_drug_cond_head = nn.Sequential(
-                nn.Linear(config.n_embd, config.n_embd // 2),
-                nn.GELU(),
-                nn.Linear(config.n_embd // 2, 1)
+            self.total_drug_cond_head = MixtureDensityHead(
+                n_embd=config.n_embd,
+                n_components=self.mdn_n_components,
+                min_value=self.total_min_value,
+                max_value=self.total_max_value,
             )
             # Provisional identity init here; reapplied after parent model init.
             self.reset_film_identity()
@@ -538,15 +663,19 @@ class MultiHeadOutput(nn.Module):
 
     def reset_film_identity(self):
         """Initialize FiLM generators to identity: gamma=1, beta=0."""
-        if not self.use_drug_conditioning:
-            return
-        for film_gen in [self.shift_film_generator, self.total_film_generator]:
-            last_layer = film_gen[-1]  # Last Linear layer
-            nn.init.zeros_(last_layer.weight)
-            with torch.no_grad():
-                # first half = gamma, second half = beta
-                last_layer.bias[:self.n_embd].fill_(1.0)
-                last_layer.bias[self.n_embd:].zero_()
+        if self.use_drug_conditioning:
+            for film_gen in [self.shift_film_generator, self.total_film_generator]:
+                last_layer = film_gen[-1]  # Last Linear layer
+                nn.init.zeros_(last_layer.weight)
+                with torch.no_grad():
+                    # first half = gamma, second half = beta
+                    last_layer.bias[:self.n_embd].fill_(1.0)
+                    last_layer.bias[self.n_embd:].zero_()
+
+        # MDN heads are sensitive to init; keep spread-out initial components.
+        self.total_head.reset_mdn_bias()
+        if self.use_drug_conditioning:
+            self.total_drug_cond_head.reset_mdn_bias()
         
     def forward(self, x, drug_emb=None, drug_token_mask=None):
         """
@@ -560,11 +689,15 @@ class MultiHeadOutput(nn.Module):
         Returns:
             dict of logits/values for each head
         """
+        shift_logits, shift_change_logits = self.shift_head(x)
+        total_mdn = self.total_head(x)
         output = {
-            'data': self.data_head(x),               # (B, T, data_vocab_size) - classification logits
-            'shift': self.shift_head(x),             # (B, T, shift_vocab_size) - classification logits
-            'total': self.total_head(x).squeeze(-1), # (B, T) - regression value
-            'time_scale': self.time_head(x),         # (B, T, data_vocab_size) - λ parameter
+            'data': self.data_head(x),             # (B, T, data_vocab_size) - classification logits
+            'shift': shift_logits,                 # (B, T, shift_vocab_size)
+            'shift_change_logits': shift_change_logits,  # (B, T, 2)
+            'total': total_mdn['mean'],           # (B, T) - point estimate for compatibility
+            'total_mdn': total_mdn,               # MDN params for NLL training/sampling
+            'time_scale': self.time_head(x),      # (B, T, data_vocab_size) - λ parameter
         }
         
         # ============================================================
@@ -576,13 +709,14 @@ class MultiHeadOutput(nn.Module):
             shift_film = self.shift_film_generator(drug_emb)  # (B, T, n_embd*2)
             shift_gamma, shift_beta = shift_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
             shift_modulated = shift_gamma * x + shift_beta  # FiLM: γ * x + β
-            shift_drug_cond = self.shift_drug_cond_head(shift_modulated)  # (B, T, shift_vocab_size)
+            shift_drug_cond, shift_change_drug_cond = self.shift_drug_cond_head(shift_modulated)
             
             # TOTAL: FiLM modulation with drug embedding
             total_film = self.total_film_generator(drug_emb)  # (B, T, n_embd*2)
             total_gamma, total_beta = total_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
             total_modulated = total_gamma * x + total_beta  # FiLM: γ * x + β
-            total_drug_cond = self.total_drug_cond_head(total_modulated).squeeze(-1)  # (B, T)
+            total_drug_mdn = self.total_drug_cond_head(total_modulated)
+            total_drug_cond = total_drug_mdn['mean']  # (B, T)
             
             # Apply drug token masking: only use FiLM output where target is a drug
             if drug_token_mask is not None:
@@ -594,6 +728,11 @@ class MultiHeadOutput(nn.Module):
                     output['shift']
                 )
                 output['shift_drug_cond'] = shift_drug_cond_masked
+                output['shift_change_logits_drug_cond'] = torch.where(
+                    drug_token_mask.unsqueeze(-1),  # (B, T, 1)
+                    shift_change_drug_cond,
+                    output['shift_change_logits']
+                )
                 
                 # TOTAL: (B, T)
                 total_drug_cond_masked = torch.where(
@@ -602,10 +741,20 @@ class MultiHeadOutput(nn.Module):
                     output['total']
                 )
                 output['total_drug_cond'] = total_drug_cond_masked
+                # MDN params: (B, T, K)
+                mask_mdn = drug_token_mask.unsqueeze(-1)
+                output['total_mdn_drug_cond'] = {
+                    'pi_logits': torch.where(mask_mdn, total_drug_mdn['pi_logits'], output['total_mdn']['pi_logits']),
+                    'mu': torch.where(mask_mdn, total_drug_mdn['mu'], output['total_mdn']['mu']),
+                    'log_s': torch.where(mask_mdn, total_drug_mdn['log_s'], output['total_mdn']['log_s']),
+                    'mean': total_drug_cond_masked,
+                }
             else:
                 # No mask: apply FiLM to all positions (backward compatibility)
                 output['shift_drug_cond'] = shift_drug_cond
+                output['shift_change_logits_drug_cond'] = shift_change_drug_cond
                 output['total_drug_cond'] = total_drug_cond
+                output['total_mdn_drug_cond'] = total_drug_mdn
         
         # For backward compatibility
         output['time'] = output['time_scale']
@@ -670,21 +819,29 @@ class CompositeDelphiConfig:
     sliding_window: int = 256
     rope_theta: float = 10000.0
     
-    # TOTAL log-transform: predict log1p(TOTAL) for better regression on skewed distribution
-    total_log_transform: bool = True
+    # TOTAL MDN options
+    mdn_n_components: int = 8
+    total_min_value: float = 0.0
+    total_max_value: float = 550.0
+    # Backward-compatibility option for legacy non-MDN checkpoints
+    total_log_transform: bool = False
     
     # Loss weights
     loss_weight_data: float = 1.0
-    loss_weight_shift: float = 1.0
-    loss_weight_total: float = 0.5
+    loss_weight_shift: float = 20.0
+    loss_weight_change: float = 5.0
+    loss_weight_total: float = 5.0
     loss_weight_time: float = 1.0
 
-    # SHIFT loss options (handles class imbalance if needed)
-    # - shift_loss_type: 'ce' (weighted cross-entropy) or 'focal'
+    # SHIFT loss options
+    # - shift_loss_type: 'dice_focal' | 'focal' | 'ce'
     # - shift_ignore_index: typically 0 (padding/unknown)
     # - shift_class_weights: per-class weights (length == shift_vocab_size). If empty, unweighted.
-    shift_loss_type: str = 'focal'
+    shift_loss_type: str = 'dice_focal'
+    shift_dice_weight: float = 0.5
     shift_ignore_index: int = 0
+    shift_maintain_idx: int = 2
+    shift_change_weight_max: float = 10.0
     shift_focal_gamma: float = 2.0
     shift_class_weights: list = field(default_factory=list)
     
@@ -877,103 +1034,115 @@ class CompositeDelphi(nn.Module):
             ignore_index=-1
         )
         
-        # 2. SHIFT Classification Loss (Weighted CE or Focal) + ignore padding(0)
+        # 2. SHIFT Losses
+        # - Stage 1: binary change detection (maintain vs changed)
+        # - Stage 2: shift class prediction (dice+focal / focal / ce)
         shift_logits_source = logits['shift']
         if 'shift_drug_cond' in logits and self.config.use_drug_conditioning:
             shift_logits_source = logits['shift_drug_cond']
+
+        change_logits_source = logits.get('shift_change_logits', None)
+        if 'shift_change_logits_drug_cond' in logits and self.config.use_drug_conditioning:
+            change_logits_source = logits['shift_change_logits_drug_cond']
 
         shift_targets_all = targets_shift.reshape(-1)
         shift_pass_tokens = shift_targets_all != -1
 
         shift_logits_flat = shift_logits_source.reshape(-1, shift_logits_source.size(-1))[shift_pass_tokens]
         shift_targets_flat = shift_targets_all[shift_pass_tokens]
-        
+        change_logits_flat = None
+        if change_logits_source is not None:
+            change_logits_flat = change_logits_source.reshape(-1, change_logits_source.size(-1))[shift_pass_tokens]
+
         # Clamp targets to valid vocab range (defensive measure)
         shift_vocab_size = self.config.shift_vocab_size
         shift_targets_flat = torch.clamp(shift_targets_flat, min=-1, max=shift_vocab_size - 1)
-        
+
         shift_ignore = int(getattr(self.config, 'shift_ignore_index', 0))
-        # also ignore explicit -1 if present
         shift_valid = (shift_targets_flat != -1) & (shift_targets_flat != shift_ignore)
         shift_logits_flat = shift_logits_flat[shift_valid]
         shift_targets_flat = shift_targets_flat[shift_valid]
+        if change_logits_flat is not None:
+            change_logits_flat = change_logits_flat[shift_valid]
 
-        if shift_logits_flat.numel() == 0:
-            loss_shift = torch.tensor(0.0, device=device)
-        else:
-            shift_loss_type = str(getattr(self.config, 'shift_loss_type', 'ce')).lower()
+        loss_shift = torch.tensor(0.0, device=device)
+        loss_change = torch.tensor(0.0, device=device)
+        if shift_logits_flat.numel() > 0:
+            shift_loss_type = str(getattr(self.config, 'shift_loss_type', 'dice_focal')).lower()
             weights_list = getattr(self.config, 'shift_class_weights', None)
             weight_t = None
             if isinstance(weights_list, (list, tuple)) and len(weights_list) == self.config.shift_vocab_size:
                 weight_t = torch.tensor(weights_list, device=device, dtype=torch.float32)
 
-            if shift_loss_type == 'focal':
-                gamma = float(getattr(self.config, 'shift_focal_gamma', 2.0))
-                loss_shift = focal_loss_multiclass(
+            gamma = float(getattr(self.config, 'shift_focal_gamma', 2.0))
+            focal_term = focal_loss_multiclass(
+                shift_logits_flat,
+                shift_targets_flat.long(),
+                gamma=gamma,
+                alpha=weight_t,
+                ignore_index=None,
+                reduction='mean',
+            )
+            if shift_loss_type == 'dice_focal':
+                dice_w = float(getattr(self.config, 'shift_dice_weight', 0.5))
+                dice_term = dice_loss_multiclass(
                     shift_logits_flat,
                     shift_targets_flat.long(),
-                    gamma=gamma,
-                    alpha=weight_t,
-                    ignore_index=None,  # already filtered
-                    reduction='mean',
+                    eps=1.0,
+                    ignore_index=None,
                 )
+                loss_shift = dice_w * dice_term + (1.0 - dice_w) * focal_term
+            elif shift_loss_type == 'focal':
+                loss_shift = focal_term
             else:
-                # weighted cross-entropy (if weight_t is provided)
                 loss_shift = F.cross_entropy(
                     shift_logits_flat,
                     shift_targets_flat.long(),
                     weight=weight_t,
                     ignore_index=-1,
                 )
-        
-        # 3. TOTAL Regression Loss (redesigned for better gradient flow)
-        # Problem: normalized 0-1 scale produced tiny gradients (~0.0002)
-        # Solution: Use raw scale (0-550) with MSE loss and asymmetric weighting
-        targets_total_float = targets_total.float()
-        total_target = targets_total_float.reshape(-1)[pass_tokens]  # (N,) target, raw scale
-        
-        # ============================================================
-        # Drug-Conditioned TOTAL Loss (if available)
-        # ============================================================
-        if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
-            # Use drug-conditioned prediction
-            total_pred = logits['total_drug_cond'].reshape(-1)[pass_tokens]
+
+            # Stage-1 change detection loss
+            if change_logits_flat is not None:
+                maintain_idx = int(getattr(self.config, 'shift_maintain_idx', 2))
+                change_targets = (shift_targets_flat.long() != maintain_idx).long()
+                n_changed = int(change_targets.sum().item())
+                n_total = int(change_targets.numel())
+                n_maintain = max(n_total - n_changed, 0)
+                if n_changed > 0:
+                    pos_w = n_maintain / max(n_changed, 1)
+                else:
+                    pos_w = 1.0
+                pos_w = float(min(max(pos_w, 1.0), float(getattr(self.config, 'shift_change_weight_max', 10.0))))
+                change_weight = torch.tensor([1.0, pos_w], device=device, dtype=torch.float32)
+                loss_change = F.cross_entropy(change_logits_flat, change_targets, weight=change_weight)
+
+        # 3. TOTAL Loss (Mixture Density NLL preferred)
+        total_target = targets_total.float().reshape(-1)[pass_tokens]  # (N,)
+        total_mdn_source = logits.get('total_mdn', None)
+        if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
+            total_mdn_source = logits['total_mdn_drug_cond']
+
+        if isinstance(total_mdn_source, dict):
+            pi_logits = total_mdn_source['pi_logits'].reshape(-1, total_mdn_source['pi_logits'].size(-1))[pass_tokens]
+            mu = total_mdn_source['mu'].reshape(-1, total_mdn_source['mu'].size(-1))[pass_tokens]
+            log_s = total_mdn_source['log_s'].reshape(-1, total_mdn_source['log_s'].size(-1))[pass_tokens]
+
+            # Mixture of logistics NLL:
+            # log p(y) = logsumexp_k(log pi_k + log Logistic(y|mu_k, s_k))
+            y = total_target.unsqueeze(-1)
+            z = (y - mu) / torch.exp(log_s)
+            log_pdf = -z - log_s - 2.0 * F.softplus(-z)
+            log_pi = F.log_softmax(pi_logits, dim=-1)
+            log_prob = torch.logsumexp(log_pi + log_pdf, dim=-1)
+            nll = -log_prob
+            loss_total = torch.clamp(nll, min=0.0, max=20.0).mean()
         else:
-            # Fallback: standard TOTAL head
+            # Fallback for legacy checkpoints without MDN params
             total_pred = logits['total'].reshape(-1)[pass_tokens]
-        
-        # Log-transform: predict and compare in log1p space
-        # This handles skewed TOTAL distribution much better
-        if self.config.total_log_transform:
-            total_target_loss = torch.log1p(total_target)
-            # No clamping in log space needed, Huber loss handles outliers
-            log_scale = torch.log1p(torch.tensor(550.0, device=device))  # ~6.31
-            
-            # Huber Loss in log space (more robust than MSE for skewed data)
-            loss_total = F.huber_loss(total_pred, total_target_loss, delta=1.0)
-            
-            # Normalize to keep loss in ~[0,1] range
-            loss_total = loss_total / (log_scale ** 2)
-        else:
-            # Original: raw scale with MSE
-            total_scale = 550.0
+            total_scale = float(getattr(self.config, 'total_max_value', 550.0))
             total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
-            
-            nonzero_mask = total_target > 0
-            zero_mask = ~nonzero_mask
-            
-            mse_all = (total_pred - total_target) ** 2
-            
-            if nonzero_mask.sum() > 0 and zero_mask.sum() > 0:
-                loss_nonzero = mse_all[nonzero_mask].mean()
-                loss_zero = mse_all[zero_mask].mean()
-                loss_total = 0.9 * loss_nonzero + 0.1 * loss_zero
-            elif nonzero_mask.sum() > 0:
-                loss_total = mse_all[nonzero_mask].mean()
-            else:
-                loss_total = mse_all.mean()
-            
-            loss_total = loss_total / (total_scale ** 2)
+            loss_total = F.mse_loss(total_pred, total_target) / (total_scale ** 2)
         
         # 4. Time-to-Event Loss
         # dt = time difference (days until next event)
@@ -1045,6 +1214,7 @@ class CompositeDelphi(nn.Module):
         total_loss = (
             self.config.loss_weight_data * loss_data +
             self.config.loss_weight_shift * loss_shift +
+            self.config.loss_weight_change * loss_change +
             self.config.loss_weight_total * loss_total +
             self.config.loss_weight_time * loss_time
         )
@@ -1059,6 +1229,7 @@ class CompositeDelphi(nn.Module):
             'loss': total_loss,
             'loss_data': loss_data,
             'loss_shift': loss_shift,
+            'loss_change': loss_change,
             'loss_total': loss_total,
             'loss_time': loss_time,
             'loss_moe': loss_moe
@@ -1172,6 +1343,10 @@ class CompositeDelphi(nn.Module):
             total_pred_drug = total_pred_base
             if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
                 total_pred_drug = logits['total_drug_cond'][:, -1]
+            total_mdn_base = logits.get('total_mdn', None)
+            total_mdn_drug = total_mdn_base
+            if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
+                total_mdn_drug = logits['total_mdn_drug_cond']
             time_logits = logits['time'][:, -1, :]
             
             # Mask ignored tokens
@@ -1211,20 +1386,52 @@ class CompositeDelphi(nn.Module):
             # Use drug-conditioned SHIFT/TOTAL only when next DATA token is a drug.
             shift_logits = shift_logits_base
             total_pred = total_pred_base
+            total_mdn_selected = total_mdn_base
             if self.config.use_drug_conditioning:
                 drug_token_min = getattr(self.config, 'drug_token_min', 1278)
                 drug_token_max = getattr(self.config, 'drug_token_max', 1288)
                 next_is_drug = (data_next >= drug_token_min) & (data_next <= drug_token_max)  # (B, 1)
                 shift_logits = torch.where(next_is_drug, shift_logits_drug, shift_logits_base)
                 total_pred = torch.where(next_is_drug.squeeze(-1), total_pred_drug, total_pred_base)
+                if isinstance(total_mdn_base, dict) and isinstance(total_mdn_drug, dict):
+                    mask_mdn = next_is_drug
+                    total_mdn_selected = {
+                        'pi_logits': torch.where(mask_mdn, total_mdn_drug['pi_logits'][:, -1, :], total_mdn_base['pi_logits'][:, -1, :]),
+                        'mu': torch.where(mask_mdn, total_mdn_drug['mu'][:, -1, :], total_mdn_base['mu'][:, -1, :]),
+                        'log_s': torch.where(mask_mdn, total_mdn_drug['log_s'][:, -1, :], total_mdn_base['log_s'][:, -1, :]),
+                    }
+            elif isinstance(total_mdn_base, dict):
+                total_mdn_selected = {
+                    'pi_logits': total_mdn_base['pi_logits'][:, -1, :],
+                    'mu': total_mdn_base['mu'][:, -1, :],
+                    'log_s': total_mdn_base['log_s'][:, -1, :],
+                }
+            if isinstance(total_mdn_selected, dict) and total_mdn_selected['pi_logits'].dim() == 3:
+                total_mdn_selected = {
+                    'pi_logits': total_mdn_selected['pi_logits'][:, -1, :],
+                    'mu': total_mdn_selected['mu'][:, -1, :],
+                    'log_s': total_mdn_selected['log_s'][:, -1, :],
+                }
             
             # Sample shift, total from their distributions
             shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True)
             
-            # Inverse log-transform if enabled: model predicts log1p(total), convert back
+            # TOTAL generation:
+            # - Prefer MDN sampling (component sampling + logistic sampling)
+            # - Fallback to legacy point estimate path for backward compatibility
             total_raw = total_pred
-            if self.config.total_log_transform:
-                total_raw = torch.expm1(total_pred)  # expm1 = exp(x) - 1, inverse of log1p
+            if isinstance(total_mdn_selected, dict):
+                pi_logits = total_mdn_selected['pi_logits']  # (B, K)
+                mu = total_mdn_selected['mu']                # (B, K)
+                log_s = total_mdn_selected['log_s']          # (B, K)
+                comp_idx = torch.distributions.Categorical(logits=pi_logits).sample()  # (B,)
+                gather_idx = comp_idx.unsqueeze(-1)
+                mu_sel = torch.gather(mu, 1, gather_idx).squeeze(-1)
+                s_sel = torch.exp(torch.gather(log_s, 1, gather_idx).squeeze(-1))
+                u = torch.rand_like(mu_sel).clamp(min=1e-6, max=1.0 - 1e-6)
+                total_raw = mu_sel + s_sel * (torch.log(u) - torch.log1p(-u))
+            elif self.config.total_log_transform:
+                total_raw = torch.expm1(total_pred)  # legacy inverse of log1p
             
             total_next = (
                 torch.clamp(

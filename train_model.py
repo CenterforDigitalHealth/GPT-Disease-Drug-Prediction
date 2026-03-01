@@ -101,16 +101,26 @@ shift_vocab_size = 5     # SHIFT: Classification (values 0-4)
 total_vocab_size = 552   # TOTAL: Embedding vocab
 
 # SHIFT imbalance handling
-shift_loss_type = 'focal'           # 'ce' or 'focal'
+shift_loss_type = 'dice_focal'      # 'dice_focal', 'focal', 'ce'
+shift_dice_weight = 0.5
 shift_ignore_index = 0
 shift_focal_gamma = 2.0  # Reduced from 5.0 to standard value to prevent hallucinations
 shift_class_weights = []  # Empty list = unweighted
+shift_maintain_idx = 2
+shift_change_weight_max = 10.0
+shift_class_weight_cap = 8.0
+
+# TOTAL MDN settings
+mdn_n_components = 8
+total_min_value = 0.0
+total_max_value = 550.0
 
 # Loss weights for composite model
 loss_weight_data = 1.0
-loss_weight_shift = 15.0  # Increased from 5.0 to heavily emphasize SHIFT learning
-loss_weight_total = 100.0
-loss_weight_time = 0.1
+loss_weight_shift = 20.0
+loss_weight_change = 5.0
+loss_weight_total = 5.0
+loss_weight_time = 1.0
 
 # architecture features
 use_moe = True
@@ -122,8 +132,8 @@ sliding_window = 128
 use_drug_conditioning = True
 rope_theta = 10000.0
 
-# TOTAL regression: log-transform for skewed distribution
-total_log_transform = True
+# TOTAL regression (legacy fallback only; MDN path does not use this)
+total_log_transform = False
 
 # adamw optimizer
 learning_rate = 6e-4
@@ -237,6 +247,8 @@ def _compute_shift_class_weights(shift_values, shift_vocab_size, shift_ignore_in
     weights = np.zeros(shift_vocab_size, dtype=np.float32)
     if nonzero.any():
         weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
+        cap = float(globals().get('shift_class_weight_cap', 8.0))
+        weights[nonzero] = np.clip(weights[nonzero], 1.0, cap)
     return weights.tolist()
 
 # 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
@@ -297,7 +309,7 @@ for pid, (start_idx, length) in enumerate(train_p2i):
     drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
     patient_shifts = patient_data['SHIFT'][drug_mask]
     minority_count = sum((patient_shifts == c).sum() for c in minority_classes)
-    patient_weights[pid] = 1.0 + minority_count * 1.0
+    patient_weights[pid] = 1.0 + minority_count * 0.3
 
 patient_weights = patient_weights / patient_weights.sum()
 patient_weights_tensor = torch.from_numpy(patient_weights)
@@ -341,6 +353,9 @@ model_args = dict(
     use_drug_conditioning=use_drug_conditioning,
     drug_token_min=drug_token_min,
     drug_token_max=drug_token_max,
+    mdn_n_components=mdn_n_components,
+    total_min_value=total_min_value,
+    total_max_value=total_max_value,
     total_log_transform=total_log_transform,
     # Composite-specific
     data_vocab_size=data_vocab_size,
@@ -348,11 +363,15 @@ model_args = dict(
     total_vocab_size=total_vocab_size,
     # SHIFT loss options
     shift_loss_type=shift_loss_type,
+    shift_dice_weight=shift_dice_weight,
     shift_ignore_index=shift_ignore_index,
+    shift_maintain_idx=shift_maintain_idx,
+    shift_change_weight_max=shift_change_weight_max,
     shift_focal_gamma=shift_focal_gamma,
     shift_class_weights=shift_class_weights,
     loss_weight_data=loss_weight_data,
     loss_weight_shift=loss_weight_shift,
+    loss_weight_change=loss_weight_change,
     loss_weight_total=loss_weight_total,
     loss_weight_time=loss_weight_time,
     # Time-to-Event distribution
@@ -423,11 +442,11 @@ if ddp:
 
 @torch.no_grad()
 def estimate_loss():
-    """Estimate loss for Composite Delphi (5-column data)"""
+    """Estimate loss for Composite Delphi"""
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters, 5)  # loss, data, shift, total, time
+        losses = torch.zeros(eval_iters, 6)  # loss, data, shift, change, total, time
         data = train_data if split == 'train' else val_data
         p2i = train_p2i if split == 'train' else val_p2i
         for k in range(eval_iters):
@@ -449,6 +468,7 @@ def estimate_loss():
                 loss['loss'],
                 loss['loss_data'],
                 loss['loss_shift'],
+                loss['loss_change'],
                 loss['loss_total'],
                 loss['loss_time']
             ])
@@ -519,7 +539,7 @@ while True:
     if iter_num % eval_interval == 0 and iter_num > 0:
         losses = estimate_loss()
 
-        # Composite model has 5 loss components
+        # Composite model loss components
         if val_loss is None:
             val_loss_unpooled = losses['val']
         val_loss_unpooled = 0.1 * losses['val'] + 0.9 * val_loss_unpooled
@@ -533,8 +553,9 @@ while True:
                 "  breakdown (train/val) - "
                 f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
                 f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
-                f"total: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
-                f"time: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}"
+                f"change: {train_breakdown[3].item():.4f}/{val_breakdown[3].item():.4f}, "
+                f"total: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}, "
+                f"time: {train_breakdown[5].item():.4f}/{val_breakdown[5].item():.4f}"
             )
 
             if wandb_log:
@@ -544,8 +565,9 @@ while True:
                     "val/loss": val_loss,
                     "val/loss_data": val_loss_unpooled[1].item(),
                     "val/loss_shift": val_loss_unpooled[2].item(),
-                    "val/loss_total": val_loss_unpooled[3].item(),
-                    "val/loss_time": val_loss_unpooled[4].item(),
+                    "val/loss_change": val_loss_unpooled[3].item(),
+                    "val/loss_total": val_loss_unpooled[4].item(),
+                    "val/loss_time": val_loss_unpooled[5].item(),
                 })
 
         # Save best checkpoint (master only)
@@ -646,6 +668,7 @@ while True:
                 "train/loss": total_loss.item(),
                 "train/loss_data": loss['loss_data'].item(),
                 "train/loss_shift": loss['loss_shift'].item(),
+                "train/loss_change": loss['loss_change'].item(),
                 "train/loss_total": loss['loss_total'].item(),
                 "train/loss_time": loss['loss_time'].item(),
                 "lr": lr,
