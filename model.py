@@ -1167,21 +1167,32 @@ class CompositeDelphi(nn.Module):
             time_logits = logits['time_scale']  # (B, T, data_vocab_size)
             time_shape = logits['time_shape']  # (B, T, data_vocab_size), already positive
 
-            # Competing-risk aggregate rate: lambda_total = sum_i exp(logit_i)
-            log_lambda = torch.logsumexp(time_logits, dim=-1)  # (B, T)
+            # Stable per-event log-rate with floor (same spirit as exponential branch):
+            # log_lambda_i = -log(exp(-logit_i) + t_min)
+            #             = logit_i - softplus(logit_i + log(t_min))
+            t_min = float(getattr(self.config, 't_min', 0.1))
+            t_min = max(t_min, 1e-8)
+            log_t_min = math.log(t_min)
+            log_lambda_i = time_logits - F.softplus(time_logits + log_t_min)  # (B, T, V)
+
+            # Competing-risk aggregate rate:
+            # lambda_total = sum_i p_i * lambda_i
+            event_log_probs = F.log_softmax(time_logits, dim=-1)
+            log_lambda = torch.logsumexp(event_log_probs + log_lambda_i, dim=-1)  # (B, T)
             log_lambda = torch.clamp(log_lambda, min=-20.0, max=20.0)
 
             # Shared shape k from event-probability-weighted mean
-            event_probs = F.softmax(time_logits, dim=-1)
+            event_probs = torch.exp(event_log_probs)
             shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.2, max=5.0)  # (B, T)
 
-            dt_flat = torch.clamp(dt.reshape(-1), min=1.0)
+            # Train Weibull in years to avoid extreme hazard from day-scale dt.
+            dt_flat = torch.clamp(dt.reshape(-1) / 365.25, min=1.0 / 365.25)
             log_lambda_flat = log_lambda.reshape(-1)
             shape_flat = shape.reshape(-1)
             log_dt = torch.log(dt_flat)
 
             # lambda * t^k = exp(log_lambda + k*log(t))
-            hazard_exp = torch.clamp(log_lambda_flat + shape_flat * log_dt, max=50.0)
+            hazard_exp = torch.clamp(log_lambda_flat + shape_flat * log_dt, max=30.0)
             lambda_tk = torch.exp(hazard_exp)
 
             log_likelihood = (
@@ -1192,7 +1203,8 @@ class CompositeDelphi(nn.Module):
             )
 
             nll = -log_likelihood[pass_tokens]
-            loss_time = torch.clamp(nll, min=0.0, max=50.0).mean()
+            nll = torch.nan_to_num(nll, nan=200.0, posinf=200.0, neginf=0.0)
+            loss_time = torch.clamp(nll, min=0.0, max=200.0).mean()
             
         else:
             # ============================================================
@@ -1367,12 +1379,16 @@ class CompositeDelphi(nn.Module):
                 event_probs = F.softmax(time_logits, dim=-1)
                 shape = torch.clamp((event_probs * time_shape_logits).sum(-1, keepdim=True), min=0.2, max=5.0)  # (B, 1)
 
-                log_lambda_i = torch.clamp(time_logits, min=-20.0, max=20.0)
-                lambda_i = torch.exp(log_lambda_i)  # (B, V)
+                t_min = float(getattr(self.config, 't_min', 0.1))
+                t_min = max(t_min, 1e-8)
+                log_t_min = math.log(t_min)
+                log_lambda_i = time_logits - F.softplus(time_logits + log_t_min)
+                lambda_i = torch.exp(torch.clamp(log_lambda_i, min=-20.0, max=20.0))  # (B, V)
                 u = torch.rand_like(time_logits).clamp_min(1e-12)
                 w = -torch.log(u) / torch.clamp(lambda_i, min=1e-8)
-                sampled_t = torch.pow(torch.clamp(w, min=1e-12), 1.0 / shape)
-                t_next = torch.clamp(sampled_t, min=0.0, max=365 * 80).min(1)
+                sampled_t_years = torch.pow(torch.clamp(w, min=1e-12), 1.0 / shape)
+                sampled_t_days = sampled_t_years * 365.25
+                t_next = torch.clamp(sampled_t_days, min=0.0, max=365 * 80).min(1)
             else:
                 # Exponential competing risks (original Delphi behavior)
                 t_next = torch.clamp(

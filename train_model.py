@@ -631,17 +631,6 @@ while True:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
 
-    # Gradient monitoring for debugging (every 1000 iters, master only)
-    if master_process and iter_num % 1000 == 0:
-        grad_info = []
-        for name, param in raw_model.named_parameters():
-            if param.grad is not None:
-                if 'total_head' in name or 'time_head' in name or 'time_shape_head' in name:
-                    grad_norm = param.grad.norm().item()
-                    grad_info.append(f"{name.split('.')[-2]}={grad_norm:.6f}")
-        if grad_info:
-            print(f"  [GRAD DEBUG] {', '.join(grad_info)}")
-
     # Optimizer step
     scaler.step(optimizer)
     scaler.update()
