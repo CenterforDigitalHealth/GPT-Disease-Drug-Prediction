@@ -137,7 +137,7 @@ total_log_transform = False
 
 # adamw optimizer
 learning_rate = 6e-4
-max_iters = 20000        # Increased from 10000
+max_iters = 10000        # Increased from 10000
 # max_iters = 2000
 weight_decay = 1e-1
 beta1 = 0.9
@@ -506,8 +506,6 @@ if wandb_log:
 # =============================================================================
 
 if master_process:
-    print(f"\n{'='*60}")
-    print("Starting training: COMPOSITE Delphi")
     print(f"{'='*60}")
     print(f"  Device: {device} ({'DDP x' + str(ddp_world_size) if ddp else 'single'})")
     print(f"  Batch size: {batch_size} (x{ddp_world_size} GPUs = {batch_size * ddp_world_size} effective)")

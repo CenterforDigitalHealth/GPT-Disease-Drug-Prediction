@@ -22,6 +22,15 @@ from typing import Dict, List
 
 
 MODEL_SCALES: Dict[str, Dict[str, object]] = {
+    "small": {
+        "n_layer": 8,
+        "n_head": 8,
+        "n_kv_head": 4,
+        "n_embd": 256,
+        "dropout": 0.2,
+        "batch_size": 128,
+        "gradient_accumulation_steps": 1,
+    },
     # Current baseline in this repository
     "medium": {
         "n_layer": 12,
@@ -30,15 +39,6 @@ MODEL_SCALES: Dict[str, Dict[str, object]] = {
         "n_embd": 384,
         "dropout": 0.2,
         "batch_size": 96,
-        "gradient_accumulation_steps": 1,
-    },
-    "small": {
-        "n_layer": 8,
-        "n_head": 8,
-        "n_kv_head": 4,
-        "n_embd": 256,
-        "dropout": 0.2,
-        "batch_size": 128,
         "gradient_accumulation_steps": 1,
     },
     # Reduce per-device batch to lower OOM risk while scaling parameters
@@ -87,11 +87,7 @@ def _flatten_metrics(scale: str, metrics_by_prefix: Dict[str, Dict]) -> Dict[str
         "auc_mean",
         "auc_median",
         "shift_accuracy",
-        "shift_f1_macro",
         "shift_f1_macro_drug_cond",
-        "total_mae",
-        "total_rmse",
-        "total_r2",
         "total_mae_drug_cond",
         "total_rmse_drug_cond",
         "total_r2_drug_cond",
@@ -153,14 +149,14 @@ def main() -> None:
         default="small,medium,large",
         help="Comma-separated model scales to run",
     )
-    parser.add_argument("--max_iters", type=int, default=20000, help="Training max iterations")
+    parser.add_argument("--max_iters", type=int, default=10000, help="Training max iterations")
     parser.add_argument("--eval_interval", type=int, default=2000, help="Training eval interval")
     parser.add_argument("--dataset_subset_size", type=int, default=10000, help="Eval subset size")
     parser.add_argument("--eval_batch_size", type=int, default=64, help="Eval inference batch size")
     parser.add_argument(
         "--data_files",
         type=str,
-        default="kr_val.bin,kr_test.bin",
+        default="kr_val.bin,kr_test.bin,JMDC_extval.bin",
         help="Comma-separated eval files for evaluate_auc.py",
     )
     parser.add_argument(
