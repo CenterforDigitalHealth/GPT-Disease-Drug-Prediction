@@ -14,6 +14,62 @@ import numpy as np
 import torch
 
 # =============================================================================
+# Model Size Presets
+# =============================================================================
+MODEL_SIZE_PRESETS = {
+    "small": {
+        "n_layer": 8,
+        "n_head": 8,
+        "n_kv_head": 4,
+        "n_embd": 256,
+        "dropout": 0.2,
+        "batch_size": 128,
+        "gradient_accumulation_steps": 1,
+    },
+    "medium": {
+        "n_layer": 12,
+        "n_head": 12,
+        "n_kv_head": 4,
+        "n_embd": 384,
+        "dropout": 0.2,
+        "batch_size": 96,
+        "gradient_accumulation_steps": 1,
+    },
+    "large": {
+        "n_layer": 16,
+        "n_head": 16,
+        "n_kv_head": 4,
+        "n_embd": 512,
+        "dropout": 0.2,
+        "batch_size": 48,
+        "gradient_accumulation_steps": 2,
+    },
+}
+MODEL_SIZE_KEYS = tuple(next(iter(MODEL_SIZE_PRESETS.values())).keys())
+
+
+def _get_cli_arg_value(key: str):
+    prefix = f"--{key}="
+    for arg in sys.argv[1:]:
+        if arg.startswith(prefix):
+            return arg[len(prefix):]
+    return None
+
+
+def _apply_model_size_preset(size_name: str) -> str:
+    size_name = str(size_name).lower()
+    if size_name == "custom":
+        return size_name
+    if size_name not in MODEL_SIZE_PRESETS:
+        valid = ", ".join(sorted(list(MODEL_SIZE_PRESETS.keys()) + ["custom"]))
+        raise ValueError(f"Unknown model_size '{size_name}'. Valid options: {valid}")
+    preset = MODEL_SIZE_PRESETS[size_name]
+    for key, value in preset.items():
+        globals()[key] = value
+    return size_name
+
+
+# =============================================================================
 # Auto Multi-GPU Detection & DDP Launch
 # =============================================================================
 def _auto_ddp():
@@ -86,6 +142,7 @@ block_size = 512
 
 # model selection (composite only)
 model_type = 'composite'
+model_size = 'medium'  # 'small' | 'medium' | 'large' | 'custom'
 
 # Model config
 n_layer = 12
@@ -94,6 +151,15 @@ n_kv_head = 4  # GQA (must divide n_head evenly: 12/4=3 heads per group)
 n_embd = 384
 dropout = 0.2
 bias = False
+
+# Allow one-line architecture preset from CLI, e.g. --model_size=small
+# Manual architecture args (e.g. --n_layer=10) still override this later via configurator.
+_cli_model_size = _get_cli_arg_value('model_size')
+if _cli_model_size is not None:
+    model_size = _cli_model_size
+model_size = _apply_model_size_preset(model_size)
+_pre_config_model_size = model_size
+_arch_before_configurator = {k: globals()[k] for k in MODEL_SIZE_KEYS}
 
 # Composite Delphi model config (5-column data)
 data_vocab_size = 1290   # DATA: 약품/질병 코드 수 (Classification)
@@ -176,6 +242,16 @@ JMDC_DATA_PATH = '../data/JMDC_extval.bin'
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
 exec(open('configurator.py').read())
+
+# Support model_size inside config files when architecture keys are not explicitly set there.
+# If CLI already provided --model_size, pre-config application is sufficient.
+if _cli_model_size is None:
+    _post_config_model_size = str(model_size).lower()
+    if _post_config_model_size != _pre_config_model_size:
+        _arch_after_configurator = {k: globals()[k] for k in MODEL_SIZE_KEYS}
+        if _arch_after_configurator == _arch_before_configurator:
+            model_size = _apply_model_size_preset(_post_config_model_size)
+
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
 
@@ -220,6 +296,11 @@ else:
 
 tokens_per_iter = gradient_accumulation_steps * batch_size * block_size * ddp_world_size
 if master_process:
+    print(
+        f"Model size: {model_size} | "
+        f"layers={n_layer}, heads={n_head}, kv_heads={n_kv_head}, embd={n_embd}, "
+        f"batch_size={batch_size}, grad_acc={gradient_accumulation_steps}"
+    )
     print(f"Tokens per iteration: {tokens_per_iter:,} ({ddp_world_size} GPU(s))")
 
 os.makedirs(out_dir, exist_ok=True)
