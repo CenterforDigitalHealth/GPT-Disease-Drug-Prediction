@@ -8,6 +8,7 @@ import sys
 import time
 import math
 import pickle
+from datetime import datetime
 from contextlib import nullcontext
 
 import numpy as np
@@ -122,6 +123,7 @@ from utils import get_p2i_composite, get_batch_composite
 # =============================================================================
 
 out_dir = 'out'
+out_dir_use_timestamp = True  # when out_dir=='out' and scratch, save to out/YYYYMMDD_HHMMSS
 eval_interval = 2000
 log_interval = 100
 eval_iters = 200
@@ -294,6 +296,29 @@ else:
         device = 'cpu'
         print("Using CPU")
 
+# Resolve final checkpoint directory
+# - default behavior: out -> out/YYYYMMDD_HHMMSS for scratch runs
+# - keep explicit out_dir values unchanged (important for ablation scripts)
+if (
+    init_from == 'scratch'
+    and out_dir_use_timestamp
+    and os.path.normpath(out_dir) == 'out'
+):
+    run_timestamp = os.environ.get('TRAIN_RUN_TIMESTAMP')
+    if run_timestamp is None:
+        if ddp:
+            # Make sure all ranks use exactly the same timestamped path.
+            obj = [datetime.now().strftime('%Y%m%d_%H%M%S') if master_process else None]
+            dist.broadcast_object_list(obj, src=0)
+            run_timestamp = obj[0]
+        else:
+            run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        os.environ['TRAIN_RUN_TIMESTAMP'] = run_timestamp
+    out_dir = os.path.join(out_dir, run_timestamp)
+
+# Keep saved config aligned with the effective checkpoint directory
+config['out_dir'] = out_dir
+
 tokens_per_iter = gradient_accumulation_steps * batch_size * block_size * ddp_world_size
 if master_process:
     print(
@@ -301,6 +326,7 @@ if master_process:
         f"layers={n_layer}, heads={n_head}, kv_heads={n_kv_head}, embd={n_embd}, "
         f"batch_size={batch_size}, grad_acc={gradient_accumulation_steps}"
     )
+    print(f"Checkpoint directory: {out_dir}")
     print(f"Tokens per iteration: {tokens_per_iter:,} ({ddp_world_size} GPU(s))")
 
 os.makedirs(out_dir, exist_ok=True)
