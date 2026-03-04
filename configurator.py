@@ -3,6 +3,12 @@ from ast import literal_eval
 
 # DDP-related args injected by torchrun that should be skipped
 _ddp_skip_keys = {'local-rank', 'local_rank'}
+_key_aliases = {
+    'max_iter': 'max_iters',
+    'eval_iter': 'eval_iters',
+    'warmup_iter': 'warmup_iters',
+    'lr_decay_iter': 'lr_decay_iters',
+}
 
 for arg in sys.argv[1:]:
     if '=' not in arg:
@@ -18,6 +24,10 @@ for arg in sys.argv[1:]:
             continue
         key, val = arg.split('=', 1)
         key = key[2:]
+        if key in _key_aliases:
+            alias = _key_aliases[key]
+            print(f"Overriding: {key} -> {alias} (alias)")
+            key = alias
         # Skip DDP-related args (e.g. --local-rank=0 from torchrun)
         if key in _ddp_skip_keys:
             continue

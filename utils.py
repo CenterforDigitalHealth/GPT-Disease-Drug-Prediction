@@ -4,7 +4,8 @@ import re
 
 def get_batch_composite(ix, data, p2i, select='center', index='patient', padding='regular',
                         block_size=48, device='cpu', lifestyle_augmentations=False,
-                        no_event_token_rate=5, cut_batch=False, apply_token_shift=True):
+                        no_event_token_rate=5, cut_batch=False, apply_token_shift=True,
+                        separate_shift_na_from_padding=False, shift_na_raw_token=4):
     """
     Get a batch of composite data (DATA, SHIFT, TOTAL) from the dataset.
     
@@ -21,6 +22,11 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         no_event_token_rate: average rate of "no event" tokens in years
         cut_batch: whether to cut the batch to the smallest size possible
         apply_token_shift: whether to shift tokens by +1 to reserve 0 for padding
+        separate_shift_na_from_padding: when True, remap raw SHIFT==0 (N/A) to
+            shift_na_raw_token before synthetic no-event insertion. This keeps
+            no-event/padding(0) distinct from real N/A in SHIFT.
+        shift_na_raw_token: raw SHIFT token id used for N/A remapping when
+            separate_shift_na_from_padding=True (default: 4)
 
     Returns:
         x_data: input DATA tokens (B, T)
@@ -73,6 +79,12 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     shift_values = shift_values.masked_fill(~mask, -1)
     total_values = total_values.masked_fill(~mask, -1)
     ages = ages.masked_fill(~mask, mask_time)
+
+    # Optional: keep real SHIFT N/A (raw 0) distinct from no-event/padding (0).
+    # Apply only to real rows (mask=True), before inserting synthetic no-event tokens.
+    if separate_shift_na_from_padding:
+        na_mask = (shift_values == 0) & mask
+        shift_values = shift_values.masked_fill(na_mask, int(shift_na_raw_token))
 
     # Insert "no event" tokens
     if (padding.lower() == 'none' or
