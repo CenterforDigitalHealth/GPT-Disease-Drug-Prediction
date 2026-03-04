@@ -679,6 +679,13 @@ if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+
+def _save_checkpoint(checkpoint_obj, filename: str, tag: str):
+    ckpt_path = os.path.join(out_dir, filename)
+    torch.save(checkpoint_obj, ckpt_path)
+    if master_process:
+        print(f"[checkpoint:{tag}] saved: {ckpt_path}")
+
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -761,8 +768,7 @@ while True:
                     'config': config,
                     'model_type': model_type,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                _save_checkpoint(checkpoint, 'ckpt.pt', 'best')
 
         # Save periodic checkpoint (master only)
         if master_process and iter_num % 10_000 == 0:
@@ -775,8 +781,7 @@ while True:
                 'config': config,
                 'model_type': model_type,
             }
-            print(f"saving periodic checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
+            _save_checkpoint(checkpoint, f'ckpt_{iter_num}.pt', f'periodic@{iter_num}')
 
     if iter_num == 0 and eval_only:
         break

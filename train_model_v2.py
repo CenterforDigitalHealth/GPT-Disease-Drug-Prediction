@@ -233,6 +233,8 @@ ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
 apply_token_shift = False
+separate_shift_na_from_padding = True
+shift_na_raw_token = 4
 
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
@@ -254,6 +256,11 @@ if _cli_model_size is None:
         _arch_after_configurator = {k: globals()[k] for k in MODEL_SIZE_KEYS}
         if _arch_after_configurator == _arch_before_configurator:
             model_size = _apply_model_size_preset(_post_config_model_size)
+
+# If SHIFT N/A is separated from padding/no-event, shifted mode needs one extra class:
+# 0=pad, 1=no-event, 2=dec, 3=maint, 4=inc, 5=na
+if separate_shift_na_from_padding and apply_token_shift and shift_vocab_size < 6:
+    shift_vocab_size = 6
 
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
@@ -409,6 +416,7 @@ val_p2i = get_p2i_composite(val_data)
 if master_process:
     print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
+    print(f"SHIFT N/A separation: {separate_shift_na_from_padding} (shift_na_raw_token={shift_na_raw_token})")
 
 # Drug token range (used by both class-weighting and patient sampling)
 drug_token_min = 1279 if apply_token_shift else 1278
@@ -504,6 +512,8 @@ model_args = dict(
     shift_focal_gamma=shift_focal_gamma,
     shift_class_weights=shift_class_weights,
     apply_token_shift=apply_token_shift,
+    separate_shift_na_from_padding=separate_shift_na_from_padding,
+    shift_na_raw_token=shift_na_raw_token,
     loss_weight_data=loss_weight_data,
     loss_weight_shift=loss_weight_shift,
     loss_weight_change=loss_weight_change,
@@ -590,7 +600,9 @@ def estimate_loss():
                                         device=device, select='left',
                                         no_event_token_rate=no_event_token_rate,
                                         cut_batch=True,
-                                        apply_token_shift=apply_token_shift)
+                                        apply_token_shift=apply_token_shift,
+                                        separate_shift_na_from_padding=separate_shift_na_from_padding,
+                                        shift_na_raw_token=shift_na_raw_token)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             with ctx:
@@ -636,6 +648,13 @@ if wandb_log:
     import wandb
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
+
+def _save_checkpoint(checkpoint_obj, filename: str, tag: str):
+    ckpt_path = os.path.join(out_dir, filename)
+    torch.save(checkpoint_obj, ckpt_path)
+    if master_process:
+        print(f"[checkpoint:{tag}] saved: {ckpt_path}")
+
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -654,7 +673,9 @@ ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
 batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                             padding='random', lifestyle_augmentations=True, select='left',
                             no_event_token_rate=no_event_token_rate,
-                            apply_token_shift=apply_token_shift)
+                            apply_token_shift=apply_token_shift,
+                            separate_shift_na_from_padding=separate_shift_na_from_padding,
+                            shift_na_raw_token=shift_na_raw_token)
 x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 
 t0 = time.time()
@@ -716,8 +737,7 @@ while True:
                     'config': config,
                     'model_type': model_type,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                _save_checkpoint(checkpoint, 'ckpt.pt', 'best')
 
         # Save periodic checkpoint (master only)
         if master_process and iter_num % 10_000 == 0:
@@ -730,8 +750,7 @@ while True:
                 'config': config,
                 'model_type': model_type,
             }
-            print(f"saving periodic checkpoint to {out_dir}")
-            torch.save(checkpoint, os.path.join(out_dir, f'ckpt_{iter_num}.pt'))
+            _save_checkpoint(checkpoint, f'ckpt_{iter_num}.pt', f'periodic@{iter_num}')
 
     if iter_num == 0 and eval_only:
         break
@@ -753,7 +772,9 @@ while True:
         batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                     padding='random', lifestyle_augmentations=True, select='left',
                                     no_event_token_rate=no_event_token_rate, cut_batch=True,
-                                    apply_token_shift=apply_token_shift)
+                                    apply_token_shift=apply_token_shift,
+                                    separate_shift_na_from_padding=separate_shift_na_from_padding,
+                                    shift_na_raw_token=shift_na_raw_token)
         x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
         total_loss = loss['loss']
 

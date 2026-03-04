@@ -796,6 +796,8 @@ class CompositeDelphiConfig:
     drug_token_min: int = 1278
     drug_token_max: int = 1288
     apply_token_shift: bool = False
+    separate_shift_na_from_padding: bool = False
+    shift_na_raw_token: int = 4
 
     # Architecture features
     use_moe: bool = True

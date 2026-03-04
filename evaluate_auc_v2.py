@@ -1208,7 +1208,10 @@ def main():
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = dict(checkpoint["model_args"])
     eval_apply_token_shift = bool(model_args.get('apply_token_shift', False))
+    eval_separate_shift_na = bool(model_args.get('separate_shift_na_from_padding', False))
+    eval_shift_na_raw_token = int(model_args.get('shift_na_raw_token', 4))
     print(f"apply_token_shift from checkpoint: {eval_apply_token_shift}")
+    print(f"separate_shift_na_from_padding from checkpoint: {eval_separate_shift_na}")
     if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
         model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
         model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288
@@ -1341,15 +1344,29 @@ def main():
         print(f"  Train prefix: '{train_prefix}' (filtering will only apply to data files with same prefix)")
         train_data_raw = np.fromfile(train_data_path, dtype=composite_dtype)
         train_raw_tokens = np.unique(train_data_raw['DATA'])
-        train_valid_tokens = set((train_raw_tokens + 1).tolist())
-        
-        print(f"  Train data contains {len(train_valid_tokens)} unique tokens (after +1 shift)")
+        if eval_apply_token_shift:
+            train_valid_tokens = set((train_raw_tokens + 1).tolist())
+            token_shift_note = "after +1 shift"
+        else:
+            train_valid_tokens = set(train_raw_tokens.tolist())
+            token_shift_note = "raw token space (no shift)"
+
+        print(f"  Train data contains {len(train_valid_tokens)} unique tokens ({token_shift_note})")
         
         # Show which drug tokens are in train
+        base_drug_token = 1279 if eval_apply_token_shift else 1278
         drug_token_names = {
-            1279: 'Metformin', 1280: 'Sulfonylurea', 1281: 'DPP-4', 1282: 'Insulin',
-            1283: 'Meglitinide', 1284: 'Thiazolidinedione', 1285: 'Alpha-glucosidase',
-            1286: 'GLP-1', 1287: 'SGLT-2', 1288: 'Other', 1289: 'Death'
+            base_drug_token + 0: 'Metformin',
+            base_drug_token + 1: 'Sulfonylurea',
+            base_drug_token + 2: 'DPP-4',
+            base_drug_token + 3: 'Insulin',
+            base_drug_token + 4: 'Meglitinide',
+            base_drug_token + 5: 'Thiazolidinedione',
+            base_drug_token + 6: 'Alpha-glucosidase',
+            base_drug_token + 7: 'GLP-1',
+            base_drug_token + 8: 'SGLT-2',
+            base_drug_token + 9: 'Other',
+            base_drug_token + 10: 'Death',
         }
         print("  Drug tokens in train data:")
         for token, name in drug_token_names.items():
@@ -1404,6 +1421,8 @@ def main():
             padding="random",
             no_event_token_rate=no_event_token_rate,
             apply_token_shift=eval_apply_token_shift,
+            separate_shift_na_from_padding=eval_separate_shift_na,
+            shift_na_raw_token=eval_shift_na_raw_token,
         )
         
         # Prepare meta info with data source
