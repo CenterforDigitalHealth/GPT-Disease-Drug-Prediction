@@ -207,6 +207,10 @@ total_log_transform = False
 # adamw optimizer
 learning_rate = 6e-4
 max_iters = 10000        # Increased from 10000
+# early stopping
+# Stop when validation loss has not improved for this many iterations.
+# Set <= 0 to disable early stopping.
+early_stop_patience_iters = 300
 # max_iters = 2000
 weight_decay = 1e-1
 beta1 = 0.9
@@ -568,6 +572,9 @@ optimizer = raw_model.configure_optimizers(weight_decay, learning_rate, (beta1, 
 if init_from == 'resume':
     optimizer.load_state_dict(checkpoint['optimizer'])
 
+# Track the iteration where best validation loss was last improved.
+best_val_improve_iter = iter_num
+
 # Compile (before DDP wrapping)
 if compile:
     if master_process:
@@ -713,6 +720,7 @@ x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 t0 = time.time()
 local_iter_num = 0
 val_loss = None
+early_stop_triggered = False
 train_loss_steps, train_loss_history = [], []
 val_loss_steps, val_loss_history = [], []
 
@@ -760,10 +768,12 @@ while True:
                     "val/loss_time": val_loss_unpooled[5].item(),
                 })
 
-        # Save best checkpoint (master only)
-        if master_process and (always_save_checkpoint or val_loss < best_val_loss):
+        # Save ckpt.pt only when validation loss improves.
+        improved = val_loss < best_val_loss
+        if improved:
             best_val_loss = val_loss
-            if iter_num > 0:
+            best_val_improve_iter = iter_num
+            if master_process and iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
                     'optimizer': optimizer.state_dict(),
@@ -774,6 +784,29 @@ while True:
                     'model_type': model_type,
                 }
                 _save_checkpoint(checkpoint, 'ckpt.pt', 'best')
+                print(f"[best] ckpt.pt updated at iter {iter_num} (val/loss={val_loss:.6f})")
+
+        # Early stopping: no validation improvement for N iterations.
+        should_early_stop = False
+        if early_stop_patience_iters > 0:
+            no_improve_iters = iter_num - best_val_improve_iter
+            should_early_stop = no_improve_iters >= early_stop_patience_iters
+
+        # Keep stop decision consistent across all DDP workers.
+        if ddp:
+            stop_tensor = torch.tensor(1 if should_early_stop else 0, device=device)
+            dist.all_reduce(stop_tensor, op=dist.ReduceOp.MAX)
+            should_early_stop = bool(stop_tensor.item())
+
+        if should_early_stop:
+            if master_process:
+                no_improve_iters = iter_num - best_val_improve_iter
+                print(
+                    f"[early-stop] no val loss improvement for {no_improve_iters} iterations "
+                    f"(patience={early_stop_patience_iters}); stopping at iter {iter_num}."
+                )
+            early_stop_triggered = True
+            break
 
         # Save periodic checkpoint (master only)
         if master_process and iter_num % 10_000 == 0:
@@ -858,19 +891,6 @@ while True:
     iter_num += 1
     local_iter_num += 1
 
-    # Save rolling checkpoint every 100 iterations (overwrite ckpt.pt)
-    if master_process and iter_num % 100 == 0:
-        checkpoint = {
-            'model': raw_model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'model_args': model_args,
-            'iter_num': iter_num,
-            'best_val_loss': best_val_loss,
-            'config': config,
-            'model_type': model_type,
-        }
-        _save_checkpoint(checkpoint, 'ckpt.pt', f'iter100@{iter_num}')
-
     # Termination
     if iter_num > max_iters:
         break
@@ -885,6 +905,8 @@ if master_process:
 
     print(f"\n{'='*60}")
     print(f"Training completed!")
+    if early_stop_triggered:
+        print(f"Early stopping: triggered (patience={early_stop_patience_iters} iters)")
     print(f"Best validation loss: {best_val_loss:.4f}")
     print(f"Total iterations: {iter_num}")
     print(f"{'='*60}")
