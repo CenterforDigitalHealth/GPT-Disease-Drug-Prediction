@@ -615,6 +615,39 @@ def _save_checkpoint(checkpoint_obj, filename: str, tag: str):
     if master_process:
         print(f"[checkpoint:{tag}] saved: {ckpt_path}")
 
+
+def _save_loss_plot(train_steps, train_losses, val_steps, val_losses):
+    if not master_process:
+        return None
+    if len(train_losses) == 0 and len(val_losses) == 0:
+        print("[plot] skipped: no loss history")
+        return None
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except Exception as e:
+        print(f"[plot] skipped: matplotlib unavailable ({e})")
+        return None
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    if len(train_losses) > 0:
+        ax.plot(train_steps, train_losses, label='train/loss', color='#1f77b4')
+    if len(val_losses) > 0:
+        ax.plot(val_steps, val_losses, label='val/loss', color='#ff7f0e')
+    ax.set_xlabel('Iteration')
+    ax.set_ylabel('Loss')
+    ax.set_title('Training Loss Curve')
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+
+    plot_path = os.path.join(out_dir, 'loss_plot.png')
+    fig.savefig(plot_path, dpi=150)
+    plt.close(fig)
+    print(f"[plot] saved: {plot_path}")
+    return plot_path
+
 # =============================================================================
 # Training Loop
 # =============================================================================
@@ -639,6 +672,8 @@ x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 t0 = time.time()
 local_iter_num = 0
 val_loss = None
+train_loss_steps, train_loss_history = [], []
+val_loss_steps, val_loss_history = [], []
 
 while True:
     # Set learning rate
@@ -669,6 +704,8 @@ while True:
                 f"total: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}, "
                 f"time: {train_breakdown[5].item():.4f}/{val_breakdown[5].item():.4f}"
             )
+            val_loss_steps.append(iter_num)
+            val_loss_history.append(val_loss)
 
             if wandb_log:
                 wandb.log({
@@ -753,6 +790,8 @@ while True:
     
     if master_process and iter_num % log_interval == 0:
         lossf = total_loss.item()
+        train_loss_steps.append(iter_num)
+        train_loss_history.append(lossf)
         # Show lr trend
         if iter_num > 0 and iter_num % (log_interval * 10) == 0:
             prev_lr = get_lr(iter_num - log_interval) if decay_lr else learning_rate
@@ -776,11 +815,31 @@ while True:
     iter_num += 1
     local_iter_num += 1
 
+    # Save rolling checkpoint every 100 iterations (overwrite ckpt.pt)
+    if master_process and iter_num % 100 == 0:
+        checkpoint = {
+            'model': raw_model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'model_args': model_args,
+            'iter_num': iter_num,
+            'best_val_loss': best_val_loss,
+            'config': config,
+            'model_type': model_type,
+        }
+        _save_checkpoint(checkpoint, 'ckpt.pt', f'iter100@{iter_num}')
+
     # Termination
     if iter_num > max_iters:
         break
 
 if master_process:
+    loss_plot_path = _save_loss_plot(
+        train_loss_steps, train_loss_history,
+        val_loss_steps, val_loss_history,
+    )
+    if wandb_log and loss_plot_path is not None:
+        wandb.log({"train/loss_plot": wandb.Image(loss_plot_path)})
+
     print(f"\n{'='*60}")
     print(f"Training completed!")
     print(f"Best validation loss: {best_val_loss:.4f}")

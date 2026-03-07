@@ -115,7 +115,7 @@ def _auto_ddp():
 
 _auto_ddp()
 
-from model_v3 import CompositeDelphi, CompositeDelphiConfig
+from model_v5 import CompositeDelphi, CompositeDelphiConfig
 from utils import get_p2i_composite, get_batch_composite
 
 # =============================================================================
@@ -174,11 +174,10 @@ shift_dice_weight = 0.5
 shift_ignore_index = -1
 shift_focal_gamma = 2.0  # Reduced from 5.0 to standard value to prevent hallucinations
 shift_class_weights = []  # Empty list = unweighted
-shift_dec_idx = -1
-shift_maintain_idx = -1
-shift_inc_idx = -1
+shift_maintain_idx = 2
 shift_change_weight_max = 10.0
 shift_class_weight_cap = 8.0
+change_vocab_size = 2
 
 # TOTAL MDN settings
 mdn_n_components = 8
@@ -188,7 +187,7 @@ total_max_value = 550.0
 # Loss weights for composite model
 loss_weight_data = 1.0
 loss_weight_shift = 20.0
-loss_weight_change = 5.0
+loss_weight_change = 0.0
 loss_weight_total = 5.0
 loss_weight_time = 1.0
 
@@ -236,8 +235,6 @@ no_event_token_rate = 5
 apply_token_shift = False
 separate_shift_na_from_padding = True
 shift_na_raw_token = 4
-shift_loss_drug_only = True
-shift_loss_include_death = False
 
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
@@ -260,23 +257,10 @@ if _cli_model_size is None:
         if _arch_after_configurator == _arch_before_configurator:
             model_size = _apply_model_size_preset(_post_config_model_size)
 
-# Resolve SHIFT class indices from tokenization mode unless explicitly set.
-if apply_token_shift:
-    _default_shift_dec_idx, _default_shift_maintain_idx, _default_shift_inc_idx = 2, 3, 4
-else:
-    _default_shift_dec_idx, _default_shift_maintain_idx, _default_shift_inc_idx = 1, 2, 3
-
 # If SHIFT N/A is separated from padding/no-event, shifted mode needs one extra class:
 # 0=pad, 1=no-event, 2=dec, 3=maint, 4=inc, 5=na
 if separate_shift_na_from_padding and apply_token_shift and shift_vocab_size < 6:
     shift_vocab_size = 6
-
-if shift_dec_idx < 0:
-    shift_dec_idx = _default_shift_dec_idx
-if shift_maintain_idx < 0:
-    shift_maintain_idx = _default_shift_maintain_idx
-if shift_inc_idx < 0:
-    shift_inc_idx = _default_shift_inc_idx
 
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
@@ -376,30 +360,32 @@ def _compute_shift_class_weights(shift_values, shift_vocab_size, shift_ignore_in
         counts[shift_ignore_index] = 0.0
     nonzero = counts > 0
     weights = np.zeros(shift_vocab_size, dtype=np.float32)
-    if not nonzero.any():
-        return np.ones(shift_vocab_size, dtype=np.float32).tolist()
-    weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
-    cap = float(globals().get('shift_class_weight_cap', 8.0))
-    weights[nonzero] = np.clip(weights[nonzero], 1.0, cap)
+    if nonzero.any():
+        weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
+        cap = float(globals().get('shift_class_weight_cap', 8.0))
+        weights[nonzero] = np.clip(weights[nonzero], 1.0, cap)
     return weights.tolist()
 
 
-def _remap_shift_to_direction_np(shift_values: np.ndarray, shifted: bool) -> np.ndarray:
+def _remap_shift_to_change_np(shift_values: np.ndarray, shifted: bool) -> np.ndarray:
     """
-    Remap SHIFT labels to direction labels:
-    - decrease -> 0
-    - increase -> 1
-    - maintain/others -> -1 (ignored)
+    Remap SHIFT labels to binary change labels:
+    - changed(1): Dec/Inc
+    - maintain(0): Maint
     """
     out = np.full(shift_values.shape, -1, dtype=np.int64)
     if shifted:
-        # shifted labels: 2=Dec, 3=Maint, 4=Inc
-        out[shift_values == 2] = 0
-        out[shift_values == 4] = 1
+        # shifted labels: Dec=2, Maint=3, Inc=4
+        is_dec = shift_values == 2
+        is_maint = shift_values == 3
+        is_inc = shift_values == 4
     else:
-        # raw labels: 1=Dec, 2=Maint, 3=Inc
-        out[shift_values == 1] = 0
-        out[shift_values == 3] = 1
+        # raw labels: Dec=1, Maint=2, Inc=3
+        is_dec = shift_values == 1
+        is_maint = shift_values == 2
+        is_inc = shift_values == 3
+    out[is_maint] = 0
+    out[is_dec | is_inc] = 1
     return out
 
 # 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
@@ -430,54 +416,41 @@ val_p2i = get_p2i_composite(val_data)
 if master_process:
     print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
-    print(
-        "SHIFT target policy: "
-        f"drug_only={shift_loss_drug_only}, include_death={shift_loss_include_death}, "
-        f"separate_shift_na_from_padding={separate_shift_na_from_padding}"
-    )
+    print(f"SHIFT N/A separation: {separate_shift_na_from_padding} (shift_na_raw_token={shift_na_raw_token})")
 
 # Drug token range (used by both class-weighting and patient sampling)
 drug_token_min = 1279 if apply_token_shift else 1278
 drug_token_max = 1289 if apply_token_shift else 1288
-death_token_id = 1289 if apply_token_shift else 1288
 
-def _get_shift_target_mask(data_tokens: np.ndarray) -> np.ndarray:
-    if not shift_loss_drug_only:
-        return np.ones(data_tokens.shape, dtype=bool)
-    mask = (data_tokens >= drug_token_min) & (data_tokens <= drug_token_max)
-    if not shift_loss_include_death:
-        mask = mask & (data_tokens != death_token_id)
-    return mask
-
-# Dynamic Class Weighting (Stage-2 direction: dec vs inc)
+# Dynamic Class Weighting (SHIFT)
 if not shift_class_weights:
-    drug_mask = _get_shift_target_mask(train_data['DATA'])
+    drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
     shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
     if apply_token_shift:
         shift_values = shift_values + 1
-    direction_values = _remap_shift_to_direction_np(shift_values, shifted=apply_token_shift)
-    direction_values = direction_values[direction_values >= 0]
+    shift_values = _remap_shift_to_change_np(shift_values, shifted=apply_token_shift)
+    shift_values = shift_values[shift_values >= 0]
     shift_class_weights = _compute_shift_class_weights(
-        direction_values,
-        shift_vocab_size=2,
-        shift_ignore_index=-1,
+        shift_values,
+        change_vocab_size,
+        shift_ignore_index,
     )
     if master_process:
-        print(f"Computed direction class weights (dec/inc, drug-token subset): {shift_class_weights}")
+        print(f"Computed binary change class weights (drug-token subset): {shift_class_weights}")
 
 # WeightedRandomSampler: Patient-level balanced sampling
 if master_process:
-    print("Computing patient-level sampling weights for SHIFT balancing...")
+    print("Computing patient-level sampling weights for binary-change balancing...")
 
-minority_classes = [1, 3] if not apply_token_shift else [2, 4]
 patient_weights = np.zeros(len(train_p2i), dtype=np.float32)
 for pid, (start_idx, length) in enumerate(train_p2i):
     patient_data = train_data[start_idx:start_idx + length]
-    drug_mask = _get_shift_target_mask(patient_data['DATA'])
+    drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
     patient_shifts = patient_data['SHIFT'][drug_mask].astype(np.int64)
     if apply_token_shift:
         patient_shifts = patient_shifts + 1
-    minority_count = sum((patient_shifts == c).sum() for c in minority_classes)
+    patient_changes = _remap_shift_to_change_np(patient_shifts, shifted=apply_token_shift)
+    minority_count = (patient_changes == 1).sum()
     patient_weights[pid] = 1.0 + minority_count * 0.3
 
 patient_weights = patient_weights / patient_weights.sum()
@@ -485,7 +458,7 @@ patient_weights_tensor = torch.from_numpy(patient_weights)
 
 minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
 if master_process:
-    print(f"  Patients with minority SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+    print(f"  Patients with changed SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
     print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
 
 # Downsample to requested fraction
@@ -534,14 +507,10 @@ model_args = dict(
     shift_loss_type=shift_loss_type,
     shift_dice_weight=shift_dice_weight,
     shift_ignore_index=shift_ignore_index,
-    shift_dec_idx=shift_dec_idx,
     shift_maintain_idx=shift_maintain_idx,
-    shift_inc_idx=shift_inc_idx,
     shift_change_weight_max=shift_change_weight_max,
     shift_focal_gamma=shift_focal_gamma,
     shift_class_weights=shift_class_weights,
-    shift_loss_drug_only=shift_loss_drug_only,
-    shift_loss_include_death=shift_loss_include_death,
     apply_token_shift=apply_token_shift,
     separate_shift_na_from_padding=separate_shift_na_from_padding,
     shift_na_raw_token=shift_na_raw_token,
