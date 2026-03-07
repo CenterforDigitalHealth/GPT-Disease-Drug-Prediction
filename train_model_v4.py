@@ -705,6 +705,7 @@ if master_process:
     print(f"  Block size: {block_size}")
     print(f"  Max iterations: {max_iters}")
     print(f"  Learning rate: {learning_rate}")
+    print(f"  Validation interval: every {eval_interval} iterations")
     print(f"{'='*60}\n")
 
 # Initial batch (weighted sampling for SHIFT class balance)
@@ -785,6 +786,8 @@ while True:
                 }
                 _save_checkpoint(checkpoint, 'ckpt.pt', 'best')
                 print(f"[best] ckpt.pt updated at iter {iter_num} (val/loss={val_loss:.6f})")
+        elif master_process:
+            print(f"[best] not updated at iter {iter_num} (val/loss={val_loss:.6f}, best={best_val_loss:.6f})")
 
         # Early stopping: no validation improvement for N iterations.
         should_early_stop = False
@@ -868,13 +871,14 @@ while True:
         lossf = total_loss.item()
         train_loss_steps.append(iter_num)
         train_loss_history.append(lossf)
+        valf = f"{val_loss:.4f}" if val_loss is not None else "n/a"
         # Show lr trend
         if iter_num > 0 and iter_num % (log_interval * 10) == 0:
             prev_lr = get_lr(iter_num - log_interval) if decay_lr else learning_rate
             lr_change = "↑" if lr > prev_lr else "↓" if lr < prev_lr else "="
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e} {lr_change} (warmup: {iter_num < warmup_iters}, decay: {iter_num > warmup_iters})")
+            print(f"iter {iter_num}: loss {lossf:.4f}, val {valf}, time {dt*1000:.2f}ms, lr {lr:.2e} {lr_change} (warmup: {iter_num < warmup_iters}, decay: {iter_num > warmup_iters})")
         else:
-            print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, lr {lr:.2e}")
+            print(f"iter {iter_num}: loss {lossf:.4f}, val {valf}, time {dt*1000:.2f}ms, lr {lr:.2e}")
 
         if wandb_log:
             wandb.log({
