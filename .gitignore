@@ -5,3 +5,11 @@ results/
 analyze_results.py.ipynb_checkpoints/
 figure/.ipynb_checkpoints
 figure/figutils/.ipynb_checkpoints
+out/*
+.ipynb_checkpoints/*
+*.parquet
+*.pt
+ablation/**/.ipynb_checkpoints/
+ablation/**/eval_out/
+ablation/**/train_out/
+ablation/**/logs/
