@@ -13,3 +13,5 @@ ablation/**/.ipynb_checkpoints/
 ablation/**/eval_out/
 ablation/**/train_out/
 ablation/**/logs/
+wandb/*
+wandb

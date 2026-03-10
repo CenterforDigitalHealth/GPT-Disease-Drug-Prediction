@@ -115,14 +115,14 @@ def _auto_ddp():
 
 _auto_ddp()
 
-from model_v5 import CompositeDelphi, CompositeDelphiConfig
+from model_v6 import CompositeDelphi, CompositeDelphiConfig
 from utils import get_p2i_composite, get_batch_composite
 
 # =============================================================================
 # Default Configuration
 # =============================================================================
 
-out_dir = 'out'
+out_dir = 'out_v6'
 out_dir_use_timestamp = True  # when out_dir=='out' and scratch, save to out/YYYYMMDD_HHMMSS
 eval_interval = 100
 log_interval = 100
@@ -219,7 +219,7 @@ max_iters = 10000        # Increased from 10000
 # Stop when validation loss has not improved for this many iterations.
 # Set <= 0 to disable early stopping.
 early_stop_patience_iters = 1000
-# max_iters = 2000
+
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -228,7 +228,7 @@ grad_clip = 1.0
 # learning rate decay settings
 decay_lr = True
 warmup_iters = 1000
-lr_decay_iters = 9000
+lr_decay_iters = 9000   # Adjusted for 20000 max_iters
 min_lr = 3e-5
 
 # system

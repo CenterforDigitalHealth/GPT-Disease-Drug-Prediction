@@ -115,14 +115,14 @@ def _auto_ddp():
 
 _auto_ddp()
 
-from model_v5 import CompositeDelphi, CompositeDelphiConfig
+from model_v7 import CompositeDelphi, CompositeDelphiConfig
 from utils import get_p2i_composite, get_batch_composite
 
 # =============================================================================
 # Default Configuration
 # =============================================================================
 
-out_dir = 'out'
+out_dir = 'out_v7'
 out_dir_use_timestamp = True  # when out_dir=='out' and scratch, save to out/YYYYMMDD_HHMMSS
 eval_interval = 100
 log_interval = 100
@@ -228,7 +228,7 @@ grad_clip = 1.0
 # learning rate decay settings
 decay_lr = True
 warmup_iters = 1000
-lr_decay_iters = 9000
+lr_decay_iters = 9000   # Adjusted for 20000 max_iters
 min_lr = 3e-5
 
 # system
@@ -251,10 +251,10 @@ shift_na_raw_token = 4
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
 
-TRAIN_DATA_PATH = '../data/dose/kr_train.bin'
-VAL_DATA_PATH = '../data/dose/kr_val.bin'
+TRAIN_DATA_PATH = '../data/kr_train.bin'
+VAL_DATA_PATH = '../data/kr_val.bin'
 # JMDC path for domain generalization (mixing)
-JMDC_DATA_PATH = '../data/dose/JMDC_extval.bin'
+JMDC_DATA_PATH = '../data/JMDC_extval.bin'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]

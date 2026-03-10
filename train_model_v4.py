@@ -124,9 +124,9 @@ from utils import get_p2i_composite, get_batch_composite
 
 out_dir = 'out'
 out_dir_use_timestamp = True  # when out_dir=='out' and scratch, save to out/YYYYMMDD_HHMMSS
-eval_interval = 2000
+eval_interval = 100
 log_interval = 100
-eval_iters = 200
+eval_iters = 100
 eval_only = False
 always_save_checkpoint = False
 init_from = 'scratch'  # 'scratch' or 'resume'
@@ -210,7 +210,7 @@ max_iters = 10000        # Increased from 10000
 # early stopping
 # Stop when validation loss has not improved for this many iterations.
 # Set <= 0 to disable early stopping.
-early_stop_patience_iters = 300
+early_stop_patience_iters = 1000
 # max_iters = 2000
 weight_decay = 1e-1
 beta1 = 0.9

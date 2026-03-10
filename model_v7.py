@@ -841,19 +841,19 @@ class CompositeDelphiConfig:
     # Loss weights
     loss_weight_data: float = 1.0
     loss_weight_shift: float = 20.0
-    # No separate auxiliary change head in v5.
+    # No separate auxiliary change head in legacy versions.
     loss_weight_change: float = 0.0
     loss_weight_total: float = 5.0
     loss_weight_time: float = 1.0
 
-    # Kept for compatibility (unused in v5 SHIFT regression)
+    # Kept for compatibility (unused in legacy SHIFT regression)
     # - shift_loss_type: 'dice_focal' | 'focal' | 'ce'
     # - shift_class_weights: legacy class weights
     shift_loss_type: str = 'dice_focal'
     shift_dice_weight: float = 0.5
     shift_ignore_index: int = -1
-    shift_maintain_idx: int = 2  # kept for compatibility (unused in v5)
-    shift_change_weight_max: float = 10.0  # kept for compatibility (unused in v5)
+    shift_maintain_idx: int = 2  # kept for compatibility (unused in legacy)
+    shift_change_weight_max: float = 10.0  # kept for compatibility (unused in legacy)
     shift_focal_gamma: float = 2.0
     shift_class_weights: list = field(default_factory=list)
     
@@ -1175,71 +1175,48 @@ class CompositeDelphi(nn.Module):
             )
         
         time_distribution = getattr(self.config, 'time_distribution', 'exponential')
-        
+
+        # v7: conditional time model p(t | y, h)
+        # Gather event-specific time parameters using the true next token y.
+        time_logits = logits['time_scale']  # (B, T, V)
+        vocab_size = time_logits.size(-1)
+        time_logits_flat = time_logits.reshape(-1, vocab_size)
+        target_event_idx = targets_flat_clamped.unsqueeze(-1)  # (B*T, 1)
+
+        t_min = float(getattr(self.config, 't_min', 0.1))
+        t_min = max(t_min, 1e-8)
+        t_min_years = max(t_min / 365.25, 1e-12)
+        log_t_min_years = math.log(t_min_years)
+
+        log_lambda_i_flat = time_logits_flat - F.softplus(time_logits_flat + log_t_min_years)
+        log_lambda_y = torch.gather(log_lambda_i_flat, 1, target_event_idx).squeeze(-1)
+        log_lambda_y = torch.clamp(log_lambda_y, min=-20.0, max=20.0)
+        dt_flat = torch.clamp(dt.reshape(-1) / 365.25, min=1.0 / 365.25)
+
         if time_distribution == 'weibull':
-            # ============================================================
-            # Weibull Distribution Loss (rate parameterization)
-            # ============================================================
-            # f(t) = k * lambda * t^(k-1) * exp(-lambda * t^k)
-            # log f(t) = log(k) + log(lambda) + (k-1)*log(t) - lambda*t^k
-            # k=1이면 Exponential(rate=lambda)로 환원된다.
-            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
-            time_shape = logits['time_shape']  # (B, T, data_vocab_size), already positive
-
-            # Stable per-event log-rate with floor (same spirit as exponential branch):
-            # log_lambda_i = -log(exp(-logit_i) + t_min)
-            #             = logit_i - softplus(logit_i + log(t_min))
-            t_min = float(getattr(self.config, 't_min', 0.1))
-            t_min = max(t_min, 1e-8)
-            log_t_min = math.log(t_min)
-            log_lambda_i = time_logits - F.softplus(time_logits + log_t_min)  # (B, T, V)
-
-            # Competing-risk aggregate rate:
-            # lambda_total = sum_i p_i * lambda_i
-            event_log_probs = F.log_softmax(time_logits, dim=-1)
-            log_lambda = torch.logsumexp(event_log_probs + log_lambda_i, dim=-1)  # (B, T)
-            log_lambda = torch.clamp(log_lambda, min=-20.0, max=20.0)
-
-            # Shared shape k from event-probability-weighted mean
-            event_probs = torch.exp(event_log_probs)
-            shape = torch.clamp((event_probs * time_shape).sum(-1), min=0.2, max=5.0)  # (B, T)
-
-            # Train Weibull in years to avoid extreme hazard from day-scale dt.
-            dt_flat = torch.clamp(dt.reshape(-1) / 365.25, min=1.0 / 365.25)
-            log_lambda_flat = log_lambda.reshape(-1)
-            shape_flat = shape.reshape(-1)
+            # Weibull: f(t|y,h) = k_y * lambda_y * t^(k_y-1) * exp(-lambda_y * t^k_y)
+            time_shape = logits['time_shape'].reshape(-1, vocab_size)
+            shape_y = torch.gather(time_shape, 1, target_event_idx).squeeze(-1)
+            shape_y = torch.clamp(shape_y, min=0.2, max=5.0)
             log_dt = torch.log(dt_flat)
-
-            # lambda * t^k = exp(log_lambda + k*log(t))
-            hazard_exp = torch.clamp(log_lambda_flat + shape_flat * log_dt, max=30.0)
+            hazard_exp = torch.clamp(log_lambda_y + shape_y * log_dt, max=30.0)
             lambda_tk = torch.exp(hazard_exp)
-
             log_likelihood = (
-                torch.log(shape_flat) +
-                log_lambda_flat +
-                (shape_flat - 1.0) * log_dt -
+                torch.log(shape_y) +
+                log_lambda_y +
+                (shape_y - 1.0) * log_dt -
                 lambda_tk
             )
-
             nll = -log_likelihood[pass_tokens]
             nll = torch.nan_to_num(nll, nan=200.0, posinf=200.0, neginf=0.0)
             loss_time = torch.clamp(nll, min=0.0, max=200.0).mean()
-            
         else:
-            # ============================================================
-            # Exponential Distribution Loss (기존 Delphi와 동일)
-            # ============================================================
-            # PDF: f(t) = λ * exp(-λt)
-            # log f(t) = log(λ) - λt
-            
-            # Use time head logits for time calculation (original Delphi approach)
-            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
-            lse = torch.logsumexp(time_logits, -1)  # (B, T)
-            lse = -torch.log(torch.exp(-lse) + self.config.t_min)
-            
-            ldt = -torch.log(dt + self.config.t_min).view(-1)
-            loss_time = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
-            loss_time = torch.mean(loss_time[pass_tokens])
+            # Exponential: f(t|y,h) = lambda_y * exp(-lambda_y * t)
+            lambda_y = torch.exp(log_lambda_y)
+            nll = -(log_lambda_y - lambda_y * dt_flat)
+            nll = nll[pass_tokens]
+            nll = torch.nan_to_num(nll, nan=200.0, posinf=200.0, neginf=0.0)
+            loss_time = torch.clamp(nll, min=0.0, max=200.0).mean()
         
         # Weighted sum of losses
         total_loss = (
@@ -1386,8 +1363,6 @@ class CompositeDelphi(nn.Module):
             total_mdn_drug = total_mdn_base
             if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
                 total_mdn_drug = logits['total_mdn_drug_cond']
-            time_logits = logits['time'][:, -1, :]
-            
             # Mask ignored tokens
             data_logits[:, self.config.ignore_tokens] = -torch.inf
             
@@ -1396,35 +1371,41 @@ class CompositeDelphi(nn.Module):
                 fill[fill == 1] = 0
                 data_logits = data_logits.scatter_(1, fill, -torch.inf)
             
-            # Sample next tokens from configured time distribution
+            # v7: sample event type from data head first: y ~ p(y|h)
+            all_masked = torch.isneginf(data_logits).all(dim=-1)
+            if all_masked.any():
+                fallback_token = 1 if data_logits.size(-1) > 1 else 0
+                data_logits = data_logits.clone()
+                data_logits[all_masked] = -torch.inf
+                data_logits[all_masked, fallback_token] = 0.0
+            data_next = torch.distributions.Categorical(logits=data_logits).sample()[:, None]
+
+            # Then sample time conditionally: t ~ p(t|y,h)
+            time_logits = logits['time'][:, -1, :]
+            target_event_idx = data_next
+            time_logit_y = torch.gather(time_logits, 1, target_event_idx).squeeze(-1)
+            t_min = float(getattr(self.config, 't_min', 0.1))
+            t_min = max(t_min, 1e-8)
+            t_min_years = max(t_min / 365.25, 1e-12)
+            log_t_min_years = math.log(t_min_years)
+            log_lambda_y = time_logit_y - F.softplus(time_logit_y + log_t_min_years)
+            log_lambda_y = torch.clamp(log_lambda_y, min=-20.0, max=20.0)
+            lambda_y = torch.exp(log_lambda_y)
+
             time_distribution = getattr(self.config, 'time_distribution', 'exponential')
             if time_distribution == 'weibull' and 'time_shape' in logits:
-                # Weibull competing risks:
-                # T_i = (-log U / lambda_i)^(1/k), lambda_i = exp(time_logit_i)
-                # Use shared k (weighted average) to stay aligned with training loss.
                 time_shape_logits = logits['time_shape'][:, -1, :]  # (B, V), already positive
-                event_probs = F.softmax(time_logits, dim=-1)
-                shape = torch.clamp((event_probs * time_shape_logits).sum(-1, keepdim=True), min=0.2, max=5.0)  # (B, 1)
-
-                t_min = float(getattr(self.config, 't_min', 0.1))
-                t_min = max(t_min, 1e-8)
-                log_t_min = math.log(t_min)
-                log_lambda_i = time_logits - F.softplus(time_logits + log_t_min)
-                lambda_i = torch.exp(torch.clamp(log_lambda_i, min=-20.0, max=20.0))  # (B, V)
-                u = torch.rand_like(time_logits).clamp_min(1e-12)
-                w = -torch.log(u) / torch.clamp(lambda_i, min=1e-8)
-                sampled_t_years = torch.pow(torch.clamp(w, min=1e-12), 1.0 / shape)
-                sampled_t_days = sampled_t_years * 365.25
-                t_next = torch.clamp(sampled_t_days, min=0.0, max=365 * 80).min(1)
+                shape_y = torch.gather(time_shape_logits, 1, target_event_idx).squeeze(-1)
+                shape_y = torch.clamp(shape_y, min=0.2, max=5.0)
+                u = torch.rand_like(lambda_y).clamp_min(1e-12)
+                w = -torch.log(u) / torch.clamp(lambda_y, min=1e-8)
+                sampled_t_years = torch.pow(torch.clamp(w, min=1e-12), 1.0 / shape_y)
             else:
-                # Exponential competing risks (original Delphi behavior)
-                t_next = torch.clamp(
-                    -torch.exp(-time_logits) * torch.rand(time_logits.shape, device=data.device).log(),
-                    min=0, max=365*80
-                ).min(1)
-            
-            data_next = t_next[1][:, None]
-            age_next = age[..., [-1]] + t_next[0][:, None]
+                u = torch.rand_like(lambda_y).clamp_min(1e-12)
+                sampled_t_years = -torch.log(u) / torch.clamp(lambda_y, min=1e-8)
+
+            sampled_t_days = torch.clamp(sampled_t_years * 365.25, min=0.0, max=365 * 80)
+            age_next = age[..., [-1]] + sampled_t_days[:, None]
 
             # Use drug-conditioned SHIFT/TOTAL only when next DATA token is a drug.
             shift_pred = shift_pred_base

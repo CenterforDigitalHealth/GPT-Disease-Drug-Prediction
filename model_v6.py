@@ -650,8 +650,8 @@ class MultiHeadOutput(nn.Module):
             # Provisional identity init here; reapplied after parent model init.
             self.reset_film_identity()
         
-        # Time Head: scale parameter (λ) for all event types
-        self.time_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
+        # v6 (Delphi-style): DATA logits are shared for event type and time-to-event.
+        # Keep only optional Weibull shape head.
         
         # Weibull shape parameter (k) - 전역 또는 per-event
         if self.time_distribution == 'weibull':
@@ -696,7 +696,6 @@ class MultiHeadOutput(nn.Module):
             'shift_mdn': shift_mdn,                # MDN params for NLL training/sampling
             'total': total_mdn['mean'],           # (B, T) - point estimate for compatibility
             'total_mdn': total_mdn,               # MDN params for NLL training/sampling
-            'time_scale': self.time_head(x),      # (B, T, data_vocab_size) - λ parameter
         }
         
         # ============================================================
@@ -758,7 +757,9 @@ class MultiHeadOutput(nn.Module):
                 output['total_drug_cond'] = total_drug_cond
                 output['total_mdn_drug_cond'] = total_drug_mdn
         
-        # For backward compatibility
+        # v6 keeps Delphi semantics: time scale uses DATA logits.
+        # Expose aliases for compatibility with existing tooling.
+        output['time_scale'] = output['data']
         output['time'] = output['time_scale']
         
         if self.time_distribution == 'weibull':
@@ -841,19 +842,19 @@ class CompositeDelphiConfig:
     # Loss weights
     loss_weight_data: float = 1.0
     loss_weight_shift: float = 20.0
-    # No separate auxiliary change head in v5.
+    # No separate auxiliary change head in legacy versions.
     loss_weight_change: float = 0.0
     loss_weight_total: float = 5.0
     loss_weight_time: float = 1.0
 
-    # Kept for compatibility (unused in v5 SHIFT regression)
+    # Kept for compatibility (unused in legacy SHIFT regression)
     # - shift_loss_type: 'dice_focal' | 'focal' | 'ce'
     # - shift_class_weights: legacy class weights
     shift_loss_type: str = 'dice_focal'
     shift_dice_weight: float = 0.5
     shift_ignore_index: int = -1
-    shift_maintain_idx: int = 2  # kept for compatibility (unused in v5)
-    shift_change_weight_max: float = 10.0  # kept for compatibility (unused in v5)
+    shift_maintain_idx: int = 2  # kept for compatibility (unused in legacy)
+    shift_change_weight_max: float = 10.0  # kept for compatibility (unused in legacy)
     shift_focal_gamma: float = 2.0
     shift_class_weights: list = field(default_factory=list)
     
@@ -1183,7 +1184,8 @@ class CompositeDelphi(nn.Module):
             # f(t) = k * lambda * t^(k-1) * exp(-lambda * t^k)
             # log f(t) = log(k) + log(lambda) + (k-1)*log(t) - lambda*t^k
             # k=1이면 Exponential(rate=lambda)로 환원된다.
-            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
+            # Delphi-style: shared logits for event type and time-to-event rate.
+            time_logits = logits['data']  # (B, T, data_vocab_size)
             time_shape = logits['time_shape']  # (B, T, data_vocab_size), already positive
 
             # Stable per-event log-rate with floor (same spirit as exponential branch):
@@ -1232,8 +1234,8 @@ class CompositeDelphi(nn.Module):
             # PDF: f(t) = λ * exp(-λt)
             # log f(t) = log(λ) - λt
             
-            # Use time head logits for time calculation (original Delphi approach)
-            time_logits = logits['time_scale']  # (B, T, data_vocab_size)
+            # Delphi-style: use DATA logits directly for time-to-event.
+            time_logits = logits['data']  # (B, T, data_vocab_size)
             lse = torch.logsumexp(time_logits, -1)  # (B, T)
             lse = -torch.log(torch.exp(-lse) + self.config.t_min)
             
@@ -1386,8 +1388,6 @@ class CompositeDelphi(nn.Module):
             total_mdn_drug = total_mdn_base
             if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
                 total_mdn_drug = logits['total_mdn_drug_cond']
-            time_logits = logits['time'][:, -1, :]
-            
             # Mask ignored tokens
             data_logits[:, self.config.ignore_tokens] = -torch.inf
             
@@ -1398,6 +1398,7 @@ class CompositeDelphi(nn.Module):
             
             # Sample next tokens from configured time distribution
             time_distribution = getattr(self.config, 'time_distribution', 'exponential')
+            time_logits = data_logits  # Delphi-style shared logits (with generation constraints applied)
             if time_distribution == 'weibull' and 'time_shape' in logits:
                 # Weibull competing risks:
                 # T_i = (-log U / lambda_i)^(1/k), lambda_i = exp(time_logit_i)

@@ -4,7 +4,7 @@ import warnings
 import torch
 # Suppress sklearn warnings about classes not in y_true
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.metrics._classification')
-from model_v5 import CompositeDelphi, CompositeDelphiConfig
+from model_v7 import CompositeDelphi, CompositeDelphiConfig
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -413,7 +413,7 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
 
 def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
     """
-    Evaluate SHIFT, TOTAL predictions for CompositeDelphi v5 model.
+    Evaluate SHIFT, TOTAL predictions for CompositeDelphi v7 model.
     
     Args:
         model: CompositeDelphi model
@@ -488,7 +488,7 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
                 targets_age=y_ages[start_idx:end_idx].to(device)
             )[0]  # Get logits dict
             
-            # v5:
+            # v7:
             # - SHIFT: regression output (B, T)
             # - TOTAL: regression output (B, T)
             shift_pred = outputs['shift']
@@ -1118,7 +1118,7 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=64, help="Batch size for model inference during evaluation")
     parser.add_argument("--data_files", type=str, default=None, 
                         help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin")
-    parser.add_argument("--train_data_file", type=str, default="dose/kr_train.bin",
+    parser.add_argument("--train_data_file", type=str, default="kr_train.bin",
                         help="Train data file to filter valid tokens. Only tokens present in train data will be evaluated.")
     args = parser.parse_args()
 
@@ -1234,9 +1234,9 @@ def main():
     else:
         # Default: evaluate all files (internal val/test + external validations)
         data_files_list = [
-            ("dose/kr_val.bin", "val"),
-            ("dose/kr_test.bin", "test"),
-            ("dose/JMDC_extval.bin", "extval_jmdc"),
+            ("kr_val.bin", "val"),
+            ("kr_test.bin", "test"),
+            ("JMDC_extval.bin", "extval_jmdc"),
             ("UKB_extval.bin", "extval_ukb"),
         ]
     
