@@ -442,6 +442,9 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
     eval_shift_continuous = bool(getattr(model.config, 'shift_continuous', False))
     eval_shift_exclude_na_token = bool(getattr(model.config, 'shift_exclude_na_token', True))
     eval_separate_shift_na = bool(getattr(model.config, 'separate_shift_na_from_padding', False))
+    # Continuous SHIFT regression should not treat value 0 as a special NA token.
+    if eval_shift_continuous and eval_separate_shift_na:
+        eval_separate_shift_na = False
     eval_shift_na_token = int(getattr(model.config, 'shift_na_raw_token', 4))
     if eval_apply_token_shift:
         eval_shift_na_token += 1
@@ -494,6 +497,15 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
             shift_pred = outputs['shift']
             total_pred = outputs['total']
 
+            # SHIFT log handling:
+            # - New checkpoints (shift_log=True): model already outputs raw-space SHIFT.
+            # - Legacy checkpoints (shift_log_transform=True, non-MDN): outputs may be log-space.
+            shift_log = bool(getattr(model.config, 'shift_log', False))
+            shift_log_transform_legacy = bool(getattr(model.config, 'shift_log_transform', False))
+            has_mdn_shift = isinstance(outputs.get('shift_mdn', None), dict)
+            if shift_log_transform_legacy and (not shift_log) and (not has_mdn_shift):
+                shift_pred = torch.expm1(shift_pred)
+
             # Inverse log-transform if model was trained with total_log_transform
             total_log_transform = getattr(model.config, 'total_log_transform', False)
             has_mdn_total = isinstance(outputs.get('total_mdn', None), dict)
@@ -533,6 +545,9 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
                 # Drug-conditioned SHIFT (regression)
                 if use_drug_conditioning and 'shift_drug_cond' in outputs:
                     shift_drug_pred = outputs['shift_drug_cond']
+                    has_mdn_drug_shift = isinstance(outputs.get('shift_mdn_drug_cond', None), dict)
+                    if shift_log_transform_legacy and (not shift_log) and (not has_mdn_drug_shift):
+                        shift_drug_pred = torch.expm1(shift_drug_pred)
                     if shift_drug_pred.dim() == 3:
                         if shift_drug_pred.size(-1) == 1:
                             shift_drug_pred = shift_drug_pred.squeeze(-1)
@@ -1100,7 +1115,12 @@ def evaluate_auc_pipeline(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate AUC")
     parser.add_argument("--input_path", type=str, default="../data", help="Path to the dataset")
-    parser.add_argument("--output_path", type=str, default="results", help="Path to the output")
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default=None,
+        help="Path to the output. If omitted or set to 'auto', use the checkpoint directory.",
+    )
     parser.add_argument("--model_ckpt_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--model_type", type=str, default='composite', choices=['composite'],
                         help="Model type (composite only)")
@@ -1118,7 +1138,7 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=64, help="Batch size for model inference during evaluation")
     parser.add_argument("--data_files", type=str, default=None, 
                         help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin")
-    parser.add_argument("--train_data_file", type=str, default="kr_train.bin",
+    parser.add_argument("--train_data_file", type=str, default="dose/kr_train.bin",
                         help="Train data file to filter valid tokens. Only tokens present in train data will be evaluated.")
     args = parser.parse_args()
 
@@ -1127,6 +1147,11 @@ def main():
     model_type = args.model_type
     no_event_token_rate = args.no_event_token_rate
     dataset_subset_size = args.dataset_subset_size
+    ckpt_path = args.model_ckpt_path
+
+    # Resolve output path: default to checkpoint directory.
+    if output_path is None or str(output_path).strip() == "" or str(output_path).lower() == "auto":
+        output_path = str(Path(ckpt_path).resolve().parent)
 
     # Create output folder if it doesn't exist.
     if output_path is not None:
@@ -1137,21 +1162,27 @@ def main():
     seed = 1337
 
     # Load model checkpoint and initialize model.
-    ckpt_path = args.model_ckpt_path
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = dict(checkpoint["model_args"])
     eval_apply_token_shift = bool(model_args.get('apply_token_shift', False))
     eval_separate_shift_na = bool(model_args.get('separate_shift_na_from_padding', False))
     eval_shift_na_raw_token = int(model_args.get('shift_na_raw_token', 4))
     eval_shift_continuous = bool(model_args.get('shift_continuous', False))
+    eval_shift_log = bool(model_args.get('shift_log', False))
+    eval_shift_log_transform_legacy = bool(model_args.get('shift_log_transform', False))
     eval_shift_min = float(model_args.get('shift_min_value', -1.0))
     eval_shift_max = float(model_args.get('shift_max_value', -1.0))
     eval_shift_input_scale = float(model_args.get('shift_input_scale', 1.0))
     print(f"apply_token_shift from checkpoint: {eval_apply_token_shift}")
     print(f"separate_shift_na_from_padding from checkpoint: {eval_separate_shift_na}")
     print(f"shift_continuous from checkpoint: {eval_shift_continuous}")
+    print(f"shift_log from checkpoint: {eval_shift_log}")
+    print(f"shift_log_transform (legacy) from checkpoint: {eval_shift_log_transform_legacy}")
     print(f"shift_range from checkpoint: [{eval_shift_min}, {eval_shift_max}]")
     print(f"shift_input_scale from checkpoint: {eval_shift_input_scale}")
+    if eval_shift_continuous and eval_separate_shift_na:
+        print("[fix] shift_continuous=True -> forcing separate_shift_na_from_padding=False for evaluation")
+        eval_separate_shift_na = False
     if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
         model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
         model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288
@@ -1236,7 +1267,7 @@ def main():
         data_files_list = [
             ("dose/kr_val.bin", "val"),
             ("dose/kr_test.bin", "test"),
-            ("dose/JMDC_extval.bin", "extval_jmdc"),
+            ("dose/JMDC_exval2.bin", "extval_jmdc"),
             ("UKB_extval.bin", "extval_ukb"),
         ]
     
@@ -1361,7 +1392,8 @@ def main():
             padding="random",
             no_event_token_rate=no_event_token_rate,
             apply_token_shift=eval_apply_token_shift,
-            separate_shift_na_from_padding=eval_separate_shift_na,
+            shift_continuous=eval_shift_continuous,
+            separate_shift_na_from_padding=(eval_separate_shift_na and not eval_shift_continuous),
             shift_na_raw_token=eval_shift_na_raw_token,
         )
         
@@ -1387,7 +1419,7 @@ def main():
             seed=seed,
             n_bootstrap=args.n_bootstrap,
             meta_info=meta_info,
-            train_valid_tokens=None,  # No train filtering - evaluate all tokens in data
+            train_valid_tokens=train_valid_tokens,
         )
         
         df_auc_unpooled, df_auc_merged, composite_metrics = result

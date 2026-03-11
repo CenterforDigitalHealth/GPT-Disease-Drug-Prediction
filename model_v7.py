@@ -832,6 +832,9 @@ class CompositeDelphiConfig:
     shift_continuous: bool = False
     shift_input_scale: float = 1.0
     shift_exclude_na_token: bool = True
+    # SHIFT supervision controls (useful when SHIFT is meaningful only on drug tokens)
+    shift_loss_drug_only: bool = True
+    shift_exclude_no_event_token: bool = True
     shift_mdn_nll_weight: float = 0.05
     total_min_value: float = 0.0
     total_max_value: float = 550.0
@@ -1072,6 +1075,19 @@ class CompositeDelphi(nn.Module):
                 is_valid_shift = (shift_targets_discrete == 1) | (shift_targets_discrete == 2) | (shift_targets_discrete == 3)
             shift_valid_mask = shift_pass_tokens & is_valid_shift
 
+        # Optional: remove synthetic no-event SHIFT token from regression targets.
+        if shift_continuous and bool(getattr(self.config, 'shift_exclude_no_event_token', True)):
+            no_event_token = 1 if bool(getattr(self.config, 'apply_token_shift', False)) else 0
+            shift_valid_mask = shift_valid_mask & (shift_targets_all != float(no_event_token))
+
+        # Optional: train SHIFT only on drug targets (recommended for dosing tasks).
+        if bool(getattr(self.config, 'shift_loss_drug_only', True)):
+            drug_token_min = int(getattr(self.config, 'drug_token_min', 1278))
+            drug_token_max = int(getattr(self.config, 'drug_token_max', 1288))
+            target_data_flat = targets_flat
+            drug_token_mask = (target_data_flat >= drug_token_min) & (target_data_flat <= drug_token_max)
+            shift_valid_mask = shift_valid_mask & drug_token_mask
+
         shift_min = float(getattr(self.config, 'shift_min_value', -1.0))
         shift_max = float(getattr(self.config, 'shift_max_value', -1.0))
         if shift_max <= shift_min:
@@ -1083,6 +1099,7 @@ class CompositeDelphi(nn.Module):
             else:
                 shift_min, shift_max = 1.0, 3.0
 
+        shift_valid_count = shift_valid_mask.sum()
         loss_shift = torch.tensor(0.0, device=device)
         loss_change = torch.tensor(0.0, device=device)
         shift_scale = max(shift_max - shift_min, 1.0)
@@ -1237,6 +1254,7 @@ class CompositeDelphi(nn.Module):
             'loss': total_loss,
             'loss_data': loss_data,
             'loss_shift': loss_shift,
+            'shift_valid_count': shift_valid_count.float(),
             'loss_change': loss_change,
             'loss_total': loss_total,
             'loss_time': loss_time,

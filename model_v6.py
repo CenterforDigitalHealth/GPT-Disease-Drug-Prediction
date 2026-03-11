@@ -22,6 +22,35 @@ import warnings
 def _is_master():
     return True
 
+
+def _to_shift_model_space(values: torch.Tensor, use_log: bool) -> torch.Tensor:
+    """Map raw SHIFT values to model space (optionally log1p)."""
+    if not use_log:
+        return values
+    return torch.log1p(torch.clamp(values, min=0.0))
+
+
+def _from_shift_model_space(values: torch.Tensor, use_log: bool) -> torch.Tensor:
+    """Map model-space SHIFT values back to raw space."""
+    if not use_log:
+        return values
+    return torch.expm1(values)
+
+
+def _shift_bounds_for_model_space(shift_min: float, shift_max: float, use_log: bool):
+    """Convert raw SHIFT bounds to model-space bounds."""
+    lo = float(shift_min)
+    hi = float(shift_max)
+    if not use_log:
+        return lo, hi
+    lo = max(lo, 0.0)
+    hi = max(hi, lo)
+    lo = math.log1p(lo)
+    hi = math.log1p(hi)
+    if hi <= lo:
+        hi = lo + 1e-6
+    return lo, hi
+
 def focal_loss_multiclass(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -452,6 +481,7 @@ class CompositeEmbedding(nn.Module):
         super().__init__()
         self.n_embd = config.n_embd
         self.shift_continuous = bool(getattr(config, 'shift_continuous', False))
+        self.shift_log = bool(getattr(config, 'shift_log', False)) and self.shift_continuous
         self.shift_input_scale = float(getattr(config, 'shift_input_scale', 1.0))
         
         # 각 필드별 Embedding
@@ -485,7 +515,9 @@ class CompositeEmbedding(nn.Module):
         if self.shift_continuous:
             # SHIFT continuous value encoding
             scale = self.shift_input_scale if self.shift_input_scale > 0 else 1.0
-            shift_value = shift.float().unsqueeze(-1) / scale
+            shift_value = shift.float()
+            shift_value = _to_shift_model_space(shift_value, self.shift_log)
+            shift_value = shift_value.unsqueeze(-1) / scale
             shift_emb = self.shift_value_proj(shift_value)
         else:
             # SHIFT embedding (legacy discrete mode)
@@ -580,10 +612,12 @@ class MultiHeadOutput(nn.Module):
         super().__init__()
         self.n_embd = config.n_embd
         self.time_distribution = getattr(config, 'time_distribution', 'exponential')
+        self.shift_continuous = bool(getattr(config, 'shift_continuous', False))
+        self.shift_log = bool(getattr(config, 'shift_log', False)) and self.shift_continuous
         self.mdn_n_components = int(getattr(config, 'mdn_n_components', 8))
         self.total_min_value = float(getattr(config, 'total_min_value', 0.0))
         self.total_max_value = float(getattr(config, 'total_max_value', 550.0))
-        if bool(getattr(config, 'shift_continuous', False)):
+        if self.shift_continuous:
             default_shift_min = 0.0
             default_shift_max = float(getattr(config, 'total_max_value', 550.0))
         else:
@@ -593,6 +627,11 @@ class MultiHeadOutput(nn.Module):
         shift_max_cfg = float(getattr(config, 'shift_max_value', -1.0))
         self.shift_min_value = default_shift_min if shift_min_cfg < 0.0 else shift_min_cfg
         self.shift_max_value = default_shift_max if shift_max_cfg < 0.0 else shift_max_cfg
+        self.shift_min_value_model, self.shift_max_value_model = _shift_bounds_for_model_space(
+            self.shift_min_value,
+            self.shift_max_value,
+            self.shift_log,
+        )
         
         # Drug-conditioning option
         self.use_drug_conditioning = getattr(config, 'use_drug_conditioning', False)
@@ -604,8 +643,8 @@ class MultiHeadOutput(nn.Module):
         self.shift_head = MixtureDensityHead(
             n_embd=config.n_embd,
             n_components=self.mdn_n_components,
-            min_value=self.shift_min_value,
-            max_value=self.shift_max_value,
+            min_value=self.shift_min_value_model,
+            max_value=self.shift_max_value_model,
         )
 
         # TOTAL head: MDN (Mixture of Logistics)
@@ -631,8 +670,8 @@ class MultiHeadOutput(nn.Module):
             self.shift_drug_cond_head = MixtureDensityHead(
                 n_embd=config.n_embd,
                 n_components=self.mdn_n_components,
-                min_value=self.shift_min_value,
-                max_value=self.shift_max_value,
+                min_value=self.shift_min_value_model,
+                max_value=self.shift_max_value_model,
             )
             
             # TOTAL: drug 조건만
@@ -690,9 +729,10 @@ class MultiHeadOutput(nn.Module):
         """
         shift_mdn = self.shift_head(x)
         total_mdn = self.total_head(x)
+        shift_mean_out = _from_shift_model_space(shift_mdn['mean'], self.shift_log)
         output = {
             'data': self.data_head(x),             # (B, T, data_vocab_size) - classification logits
-            'shift': shift_mdn['mean'],            # (B, T) - point estimate for compatibility
+            'shift': shift_mean_out,               # (B, T) - raw-space point estimate for compatibility
             'shift_mdn': shift_mdn,                # MDN params for NLL training/sampling
             'total': total_mdn['mean'],           # (B, T) - point estimate for compatibility
             'total_mdn': total_mdn,               # MDN params for NLL training/sampling
@@ -708,7 +748,7 @@ class MultiHeadOutput(nn.Module):
             shift_gamma, shift_beta = shift_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
             shift_modulated = shift_gamma * x + shift_beta  # FiLM: γ * x + β
             shift_drug_mdn = self.shift_drug_cond_head(shift_modulated)
-            shift_drug_cond = shift_drug_mdn['mean']
+            shift_drug_cond = _from_shift_model_space(shift_drug_mdn['mean'], self.shift_log)
             
             # TOTAL: FiLM modulation with drug embedding
             total_film = self.total_film_generator(drug_emb)  # (B, T, n_embd*2)
@@ -732,7 +772,7 @@ class MultiHeadOutput(nn.Module):
                     'pi_logits': torch.where(mask_mdn, shift_drug_mdn['pi_logits'], output['shift_mdn']['pi_logits']),
                     'mu': torch.where(mask_mdn, shift_drug_mdn['mu'], output['shift_mdn']['mu']),
                     'log_s': torch.where(mask_mdn, shift_drug_mdn['log_s'], output['shift_mdn']['log_s']),
-                    'mean': shift_drug_cond_masked,
+                    'mean': torch.where(mask_mdn.squeeze(-1), shift_drug_mdn['mean'], output['shift_mdn']['mean']),
                 }
                 
                 # TOTAL: (B, T)
@@ -830,7 +870,8 @@ class CompositeDelphiConfig:
     mdn_n_components: int = 8
     shift_min_value: float = -1.0  # auto: 1(raw) or 2(shifted)
     shift_max_value: float = -1.0  # auto: 3(raw) or 4(shifted)
-    shift_continuous: bool = False
+    shift_continuous: bool = True
+    shift_log: bool = False
     shift_input_scale: float = 1.0
     shift_exclude_na_token: bool = True
     shift_mdn_nll_weight: float = 0.05
@@ -974,15 +1015,24 @@ class CompositeDelphi(nn.Module):
         
         # 6. Multi-Head Output
         # Drug-Conditioning: FiLM modulation for SHIFT/TOTAL prediction
-        # CRITICAL FIX: 
-        #   - Use input `data` (current tokens), NOT `targets_data` (future tokens)
-        #   - This prevents information leakage during training
-        #   - FiLM learns to modulate predictions based on past drug history
+        #
+        # For teacher-forced training/evaluation, condition on target token ids so
+        # SHIFT/TOTAL heads learn p(value | next event token, history).
+        # For free-running inference (no targets), fall back to current input tokens.
         drug_emb = None
         drug_token_mask = None
         if self.config.use_drug_conditioning:
-            # Get drug embedding from INPUT data (not targets!)
-            drug_source = data  # Current input tokens
+            # Priority:
+            # 1) explicit conditioning tokens (if provided)
+            # 2) teacher-forced target tokens
+            # 3) current input tokens (inference fallback)
+            if drug_conditioning_data is not None:
+                drug_source = drug_conditioning_data
+            elif targets_data is not None:
+                drug_source = targets_data
+            else:
+                drug_source = data
+
             if drug_source is not None:
                 # Clamp to valid range
                 drug_source_clamped = torch.clamp(
@@ -992,7 +1042,7 @@ class CompositeDelphi(nn.Module):
                 )
                 drug_emb = self.composite_emb.data_emb(drug_source_clamped)
             
-            # Create drug token mask: FiLM only applies when TARGET is a drug
+            # Create drug token mask: FiLM only applies when next token is a drug.
             # Drug token range must match data tokenization setup.
             drug_token_min = getattr(self.config, 'drug_token_min', 1278)
             drug_token_max = getattr(self.config, 'drug_token_max', 1288)
@@ -1055,6 +1105,7 @@ class CompositeDelphi(nn.Module):
         shift_targets_all = targets_shift.reshape(-1).float()
         shift_pass_tokens = pass_tokens & (shift_targets_all != -1)
         shift_continuous = bool(getattr(self.config, 'shift_continuous', False))
+        shift_log = bool(getattr(self.config, 'shift_log', False)) and shift_continuous
         if shift_continuous and bool(getattr(self.config, 'separate_shift_na_from_padding', False)) and bool(getattr(self.config, 'shift_exclude_na_token', True)):
             shift_na_token = int(getattr(self.config, 'shift_na_raw_token', 4))
             if bool(getattr(self.config, 'apply_token_shift', False)):
@@ -1083,10 +1134,15 @@ class CompositeDelphi(nn.Module):
                 shift_min, shift_max = 2.0, 4.0
             else:
                 shift_min, shift_max = 1.0, 3.0
+        shift_min_model, shift_max_model = _shift_bounds_for_model_space(
+            shift_min,
+            shift_max,
+            shift_log,
+        )
 
         loss_shift = torch.tensor(0.0, device=device)
         loss_change = torch.tensor(0.0, device=device)
-        shift_scale = max(shift_max - shift_min, 1.0)
+        shift_scale = max(shift_max_model - shift_min_model, 1.0)
         if isinstance(shift_mdn_source, dict):
             shift_pi_logits = shift_mdn_source['pi_logits'].reshape(-1, shift_mdn_source['pi_logits'].size(-1))[shift_valid_mask]
             shift_mu = shift_mdn_source['mu'].reshape(-1, shift_mdn_source['mu'].size(-1))[shift_valid_mask]
@@ -1094,14 +1150,15 @@ class CompositeDelphi(nn.Module):
             shift_target = shift_targets_all[shift_valid_mask]
 
             if shift_target.numel() > 0:
-                shift_target = shift_target.clamp(min=shift_min, max=shift_max)
+                shift_target = _to_shift_model_space(shift_target, shift_log)
+                shift_target = shift_target.clamp(min=shift_min_model, max=shift_max_model)
                 shift_mean_src = shift_mdn_source.get('mean', None)
                 if shift_mean_src is not None:
                     shift_pred_flat = shift_mean_src.reshape(-1)[shift_valid_mask]
                 else:
                     shift_pi = F.softmax(shift_pi_logits, dim=-1)
                     shift_pred_flat = (shift_pi * shift_mu).sum(dim=-1)
-                shift_pred_flat = shift_pred_flat.clamp(min=shift_min, max=shift_max)
+                shift_pred_flat = shift_pred_flat.clamp(min=shift_min_model, max=shift_max_model)
 
                 # Primary objective for stable continuous regression.
                 loss_reg = F.smooth_l1_loss(
@@ -1129,8 +1186,10 @@ class CompositeDelphi(nn.Module):
             shift_pred_flat = shift_pred_source.reshape(-1)[shift_valid_mask]
             shift_target = shift_targets_all[shift_valid_mask]
             if shift_target.numel() > 0:
-                shift_pred_flat = torch.clamp(shift_pred_flat, min=shift_min, max=shift_max)
-                shift_target = shift_target.clamp(min=shift_min, max=shift_max)
+                shift_pred_flat = _to_shift_model_space(shift_pred_flat, shift_log)
+                shift_target = _to_shift_model_space(shift_target, shift_log)
+                shift_pred_flat = torch.clamp(shift_pred_flat, min=shift_min_model, max=shift_max_model)
+                shift_target = shift_target.clamp(min=shift_min_model, max=shift_max_model)
                 loss_shift = F.smooth_l1_loss(
                     shift_pred_flat,
                     shift_target,
@@ -1363,6 +1422,7 @@ class CompositeDelphi(nn.Module):
             max_new_tokens = 128
         
         shift_continuous = bool(getattr(self.config, 'shift_continuous', False))
+        shift_log = bool(getattr(self.config, 'shift_log', False)) and shift_continuous
         if shift_continuous and not torch.is_floating_point(shift):
             shift = shift.float()
 
@@ -1478,7 +1538,7 @@ class CompositeDelphi(nn.Module):
                 }
             
             # Sample shift, total from their distributions
-            shift_raw = shift_pred
+            shift_sample_model = _to_shift_model_space(shift_pred, shift_log)
             if isinstance(shift_mdn_selected, dict):
                 shift_pi_logits = shift_mdn_selected['pi_logits']  # (B, K)
                 shift_mu = shift_mdn_selected['mu']                # (B, K)
@@ -1488,7 +1548,7 @@ class CompositeDelphi(nn.Module):
                 shift_mu_sel = torch.gather(shift_mu, 1, shift_gather_idx).squeeze(-1)
                 shift_s_sel = torch.exp(torch.gather(shift_log_s, 1, shift_gather_idx).squeeze(-1))
                 shift_u = torch.rand_like(shift_mu_sel).clamp(min=1e-6, max=1.0 - 1e-6)
-                shift_raw = shift_mu_sel + shift_s_sel * (torch.log(shift_u) - torch.log1p(-shift_u))
+                shift_sample_model = shift_mu_sel + shift_s_sel * (torch.log(shift_u) - torch.log1p(-shift_u))
             shift_min = float(getattr(self.config, 'shift_min_value', 1.0))
             shift_max = float(getattr(self.config, 'shift_max_value', 3.0))
             if shift_min < 0.0 or shift_max < 0.0:
@@ -1498,11 +1558,18 @@ class CompositeDelphi(nn.Module):
                     shift_min, shift_max = 2.0, 4.0
                 else:
                     shift_min, shift_max = 1.0, 3.0
+            shift_min_model, shift_max_model = _shift_bounds_for_model_space(
+                shift_min,
+                shift_max,
+                shift_log,
+            )
             if shift_continuous:
-                shift_next = torch.clamp(shift_raw, min=shift_min, max=shift_max).unsqueeze(-1)
+                shift_sample_model = torch.clamp(shift_sample_model, min=shift_min_model, max=shift_max_model)
+                shift_next = _from_shift_model_space(shift_sample_model, shift_log)
+                shift_next = torch.clamp(shift_next, min=shift_min, max=shift_max).unsqueeze(-1)
             else:
                 shift_next = (
-                    torch.clamp(shift_raw.round(), min=shift_min, max=shift_max)
+                    torch.clamp(shift_sample_model.round(), min=shift_min, max=shift_max)
                     .long()
                     .unsqueeze(-1)
                 )

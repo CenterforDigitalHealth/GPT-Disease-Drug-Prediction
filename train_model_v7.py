@@ -172,8 +172,10 @@ total_vocab_size = 552   # TOTAL: Embedding vocab
 shift_continuous = True
 shift_input_scale = -1.0         # <=0: auto from train data
 shift_min_value = 0.0
-shift_max_value = -1.0           # <=0: auto from train data percentile
+shift_max_value = 500           # <=0: auto from train data percentile
 shift_exclude_na_token = True
+shift_loss_drug_only = True
+shift_exclude_no_event_token = True
 shift_mdn_nll_weight = 0.05
 
 # SHIFT legacy imbalance options (kept for compatibility; ignored in continuous mode)
@@ -245,16 +247,16 @@ ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
 apply_token_shift = False
-separate_shift_na_from_padding = True
+separate_shift_na_from_padding = False
 shift_na_raw_token = 4
 
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
 
-TRAIN_DATA_PATH = '../data/kr_train.bin'
-VAL_DATA_PATH = '../data/kr_val.bin'
+TRAIN_DATA_PATH = '../data/dose/kr_train.bin'
+VAL_DATA_PATH = '../data/dose/kr_val.bin'
 # JMDC path for domain generalization (mixing)
-JMDC_DATA_PATH = '../data/JMDC_extval.bin'
+JMDC_DATA_PATH = '../data/dose/JMDC_extval.bin'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
@@ -556,6 +558,8 @@ model_args = dict(
     shift_continuous=shift_continuous,
     shift_input_scale=shift_input_scale,
     shift_exclude_na_token=shift_exclude_na_token,
+    shift_loss_drug_only=shift_loss_drug_only,
+    shift_exclude_no_event_token=shift_exclude_no_event_token,
     shift_mdn_nll_weight=shift_mdn_nll_weight,
     total_min_value=total_min_value,
     total_max_value=total_max_value,
@@ -598,7 +602,8 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
               'data_vocab_size', 'shift_vocab_size', 'total_vocab_size',
               'shift_min_value', 'shift_max_value', 'shift_continuous',
-              'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight']:
+              'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight',
+              'shift_loss_drug_only', 'shift_exclude_no_event_token']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     if 'shift_continuous' not in checkpoint_model_args:
@@ -939,9 +944,11 @@ while True:
         if iter_num > 0 and iter_num % (log_interval * 10) == 0:
             prev_lr = get_lr(iter_num - log_interval) if decay_lr else learning_rate
             lr_change = "↑" if lr > prev_lr else "↓" if lr < prev_lr else "="
-            print(f"iter {iter_num}: loss {lossf:.4f}, val {valf}, time {dt*1000:.2f}ms, lr {lr:.2e} {lr_change} (warmup: {iter_num < warmup_iters}, decay: {iter_num > warmup_iters})")
+            shift_valid = int(loss.get('shift_valid_count', torch.tensor(-1, device=total_loss.device)).item())
+            print(f"iter {iter_num}: loss {lossf:.4f}, val {valf}, time {dt*1000:.2f}ms, lr {lr:.2e} {lr_change} (warmup: {iter_num < warmup_iters}, decay: {iter_num > warmup_iters}), shift_valid={shift_valid}")
         else:
-            print(f"iter {iter_num}: loss {lossf:.4f}, val {valf}, time {dt*1000:.2f}ms, lr {lr:.2e}")
+            shift_valid = int(loss.get('shift_valid_count', torch.tensor(-1, device=total_loss.device)).item())
+            print(f"iter {iter_num}: loss {lossf:.4f}, val {valf}, time {dt*1000:.2f}ms, lr {lr:.2e}, shift_valid={shift_valid}")
 
         if wandb_log:
             wandb.log({
@@ -949,6 +956,7 @@ while True:
                 "train/loss": total_loss.item(),
                 "train/loss_data": loss['loss_data'].item(),
                 "train/loss_shift": loss['loss_shift'].item(),
+                "train/shift_valid_count": loss.get('shift_valid_count', torch.tensor(0.0, device=total_loss.device)).item(),
                 "train/loss_total": loss['loss_total'].item(),
                 "train/loss_time": loss['loss_time'].item(),
                 "lr": lr,

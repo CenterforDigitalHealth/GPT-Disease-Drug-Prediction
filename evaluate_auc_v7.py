@@ -1234,9 +1234,9 @@ def main():
     else:
         # Default: evaluate all files (internal val/test + external validations)
         data_files_list = [
-            ("kr_val.bin", "val"),
-            ("kr_test.bin", "test"),
-            ("JMDC_extval.bin", "extval_jmdc"),
+            ("dose/kr_val.bin", "val"),
+            ("dose/kr_test.bin", "test"),
+            ("dose/JMDC_exval2.bin", "extval_jmdc"),
             ("UKB_extval.bin", "extval_ukb"),
         ]
     

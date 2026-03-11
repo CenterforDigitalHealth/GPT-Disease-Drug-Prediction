@@ -123,7 +123,7 @@ from utils import get_p2i_composite, get_batch_composite
 # =============================================================================
 
 out_dir = 'out_v6'
-out_dir_use_timestamp = True  # when out_dir=='out' and scratch, save to out/YYYYMMDD_HHMMSS
+out_dir_use_timestamp = True  # when out_dir=='out_v6' and scratch, save to MMDD_HHMM_out_v6
 eval_interval = 100
 log_interval = 100
 eval_iters = 100
@@ -144,7 +144,7 @@ block_size = 512
 
 # model selection (composite only)
 model_type = 'composite'
-model_size = 'medium'  # 'small' | 'medium' | 'large' | 'custom'
+model_size = 'small'  # 'small' | 'medium' | 'large' | 'custom'
 
 # Model config
 n_layer = 12
@@ -170,6 +170,7 @@ total_vocab_size = 552   # TOTAL: Embedding vocab
 
 # SHIFT continuous regression settings
 shift_continuous = True
+shift_log = False                # if True: train SHIFT head on log1p(target) in continuous mode
 shift_input_scale = -1.0         # <=0: auto from train data
 shift_min_value = 0.0
 shift_max_value = -1.0           # <=0: auto from train data percentile
@@ -219,7 +220,7 @@ max_iters = 10000        # Increased from 10000
 # Stop when validation loss has not improved for this many iterations.
 # Set <= 0 to disable early stopping.
 early_stop_patience_iters = 1000
-
+# max_iters = 2000
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -254,7 +255,7 @@ time_distribution = 'exponential'
 TRAIN_DATA_PATH = '../data/dose/kr_train.bin'
 VAL_DATA_PATH = '../data/dose/kr_val.bin'
 # JMDC path for domain generalization (mixing)
-JMDC_DATA_PATH = '../data/dose/JMDC_extval.bin'
+JMDC_DATA_PATH = '../data/dose/JMDC_exval2.bin'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
@@ -317,24 +318,34 @@ else:
         print("Using CPU")
 
 # Resolve final checkpoint directory
-# - default behavior: out -> out/YYYYMMDD_HHMMSS for scratch runs
-# - keep explicit out_dir values unchanged (important for ablation scripts)
+# - v6 default behavior: out_v6 -> MMDD_HHMM_out_v6 for scratch runs
+# - compatibility: normalize legacy out_v6_cont -> out_v6
+out_dir_norm = os.path.normpath(out_dir)
+out_dir_parent = os.path.dirname(out_dir_norm)
+out_dir_base = os.path.basename(out_dir_norm)
+if out_dir_base == 'out_v6_cont':
+    out_dir_base = 'out_v6'
+    out_dir_norm = os.path.join(out_dir_parent, out_dir_base) if out_dir_parent else out_dir_base
+    out_dir = out_dir_norm
+    if master_process:
+        print("[path] normalized out_dir from 'out_v6_cont' to 'out_v6'")
+
 if (
     init_from == 'scratch'
     and out_dir_use_timestamp
-    and os.path.normpath(out_dir) == 'out'
+    and out_dir_base == 'out_v6'
 ):
     run_timestamp = os.environ.get('TRAIN_RUN_TIMESTAMP')
     if run_timestamp is None:
         if ddp:
-            # Make sure all ranks use exactly the same timestamped path.
-            obj = [datetime.now().strftime('%Y%m%d_%H%M%S') if master_process else None]
+            # Make sure all ranks use exactly the same run timestamp.
+            obj = [datetime.now().strftime('%m%d_%H%M') if master_process else None]
             dist.broadcast_object_list(obj, src=0)
             run_timestamp = obj[0]
         else:
-            run_timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_timestamp = datetime.now().strftime('%m%d_%H%M')
         os.environ['TRAIN_RUN_TIMESTAMP'] = run_timestamp
-    out_dir = os.path.join(out_dir, run_timestamp)
+    out_dir = os.path.join(out_dir_parent, f"{run_timestamp}_{out_dir_base}") if out_dir_parent else f"{run_timestamp}_{out_dir_base}"
 
 # Keep saved config aligned with the effective checkpoint directory
 config['out_dir'] = out_dir
@@ -413,7 +424,7 @@ composite_dtype = np.dtype([
     ('ID', np.uint32),
     ('AGE', np.uint32),
     ('DATA', np.uint32),
-    ('SHIFT', np.float32),
+    ('SHIFT', np.uint32),
     ('TOTAL', np.uint32)
 ])
 
@@ -444,6 +455,15 @@ if shift_continuous and separate_shift_na_from_padding and shift_exclude_na_toke
     shift_valid_stats &= shift_stats != shift_na_token
 shift_stats = shift_stats[shift_valid_stats]
 if shift_continuous and shift_stats.size > 0:
+    p_hi_ref = float(np.percentile(shift_stats, 99.5))
+    if shift_max_value > 0 and shift_max_value > max(10.0, p_hi_ref * 3.0):
+        if master_process:
+            print(
+                f"[warning] shift_max_value={shift_max_value:.4f} is much larger than "
+                f"SHIFT p99.5={p_hi_ref:.4f}. "
+                "This can weaken SHIFT gradients (especially drug-conditioned head). "
+                "Consider --shift_max_value=-1 (auto) or a tighter cap."
+            )
     if shift_max_value <= shift_min_value:
         p_lo = float(np.percentile(shift_stats, 0.5))
         p_hi = float(np.percentile(shift_stats, 99.5))
@@ -453,11 +473,14 @@ if shift_continuous and shift_stats.size > 0:
         shift_min_value = max(0.0, p_lo)
         shift_max_value = max(shift_min_value + 1.0, p_hi)
     if shift_input_scale <= 0:
-        shift_input_scale = max(float(np.percentile(np.abs(shift_stats), 95.0)), 1.0)
+        shift_scale_stats = shift_stats
+        if shift_log:
+            shift_scale_stats = np.log1p(np.clip(shift_scale_stats, a_min=0.0, a_max=None))
+        shift_input_scale = max(float(np.percentile(np.abs(shift_scale_stats), 95.0)), 1.0)
     if master_process:
         print(
             f"SHIFT continuous mode: min={shift_min_value:.4f}, max={shift_max_value:.4f}, "
-            f"input_scale={shift_input_scale:.4f}"
+            f"input_scale={shift_input_scale:.4f}, shift_log={shift_log}"
         )
 
 # Dynamic Class Weighting (SHIFT, legacy discrete mode only)
@@ -554,6 +577,7 @@ model_args = dict(
     shift_min_value=shift_min_value,
     shift_max_value=shift_max_value,
     shift_continuous=shift_continuous,
+    shift_log=shift_log,
     shift_input_scale=shift_input_scale,
     shift_exclude_na_token=shift_exclude_na_token,
     shift_mdn_nll_weight=shift_mdn_nll_weight,
@@ -598,11 +622,14 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
               'data_vocab_size', 'shift_vocab_size', 'total_vocab_size',
               'shift_min_value', 'shift_max_value', 'shift_continuous',
-              'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight']:
+              'shift_log', 'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
+    if 'shift_log' not in checkpoint_model_args:
+        model_args['shift_log'] = False
     if 'shift_continuous' not in checkpoint_model_args:
         model_args['shift_continuous'] = False
+        model_args['shift_log'] = False
         model_args['shift_input_scale'] = 1.0
         model_args['shift_exclude_na_token'] = True
         model_args['shift_mdn_nll_weight'] = 0.0
@@ -672,6 +699,7 @@ def estimate_loss():
                                         no_event_token_rate=no_event_token_rate,
                                         cut_batch=True,
                                         apply_token_shift=apply_token_shift,
+                                        shift_continuous=shift_continuous,
                                         separate_shift_na_from_padding=separate_shift_na_from_padding,
                                         shift_na_raw_token=shift_na_raw_token)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
@@ -779,6 +807,7 @@ batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, de
                             padding='random', lifestyle_augmentations=True, select='left',
                             no_event_token_rate=no_event_token_rate,
                             apply_token_shift=apply_token_shift,
+                            shift_continuous=shift_continuous,
                             separate_shift_na_from_padding=separate_shift_na_from_padding,
                             shift_na_raw_token=shift_na_raw_token)
 x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
@@ -908,6 +937,7 @@ while True:
                                     padding='random', lifestyle_augmentations=True, select='left',
                                     no_event_token_rate=no_event_token_rate, cut_batch=True,
                                     apply_token_shift=apply_token_shift,
+                                    shift_continuous=shift_continuous,
                                     separate_shift_na_from_padding=separate_shift_na_from_padding,
                                     shift_na_raw_token=shift_na_raw_token)
         x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
