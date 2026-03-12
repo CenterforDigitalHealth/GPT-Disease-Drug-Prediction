@@ -38,8 +38,16 @@ for arg in sys.argv[1:]:
             except (SyntaxError, ValueError):
                 # if that goes wrong, just use the string
                 attempt = val
-            # ensure the types match ok
-            assert type(attempt) == type(globals()[key])
+            # ensure the types match ok (allow practical numeric coercions)
+            current_val = globals()[key]
+            current_type = type(current_val)
+            if current_type is float and isinstance(attempt, (int, float)) and not isinstance(attempt, bool):
+                attempt = float(attempt)
+            elif current_type is int and isinstance(attempt, float) and attempt.is_integer():
+                attempt = int(attempt)
+            elif current_type is int and isinstance(attempt, bool):
+                raise AssertionError
+            assert type(attempt) == current_type
             # cross fingers
             print(f"Overriding: {key} = {attempt}")
             globals()[key] = attempt

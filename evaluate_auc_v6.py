@@ -25,7 +25,6 @@ from sklearn.metrics import (
     confusion_matrix
 )
 
-
 def auc(x1, x2):
     n1 = len(x1)
     n2 = len(x2)
@@ -1267,7 +1266,7 @@ def main():
         data_files_list = [
             ("dose/kr_val.bin", "val"),
             ("dose/kr_test.bin", "test"),
-            ("dose/JMDC_exval2.bin", "extval_jmdc"),
+            ("dose/JMDC_extval.bin", "extval_jmdc"),
             ("UKB_extval.bin", "extval_ukb"),
         ]
     

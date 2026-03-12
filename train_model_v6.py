@@ -174,6 +174,8 @@ shift_log = False                # if True: train SHIFT head on log1p(target) in
 shift_input_scale = -1.0         # <=0: auto from train data
 shift_min_value = 0.0
 shift_max_value = -1.0           # <=0: auto from train data percentile
+shift_auto_min_percentile = 0.5  # used when shift_max_value <= shift_min_value
+shift_auto_max_percentile = 99.5 # set 100.0 to use observed max
 shift_exclude_na_token = True
 shift_mdn_nll_weight = 0.05
 
@@ -274,6 +276,11 @@ if _cli_model_size is None:
 # 0=pad, 1=no-event, 2=dec, 3=maint, 4=inc, 5=na
 if separate_shift_na_from_padding and apply_token_shift and shift_vocab_size < 6:
     shift_vocab_size = 6
+
+# Continuous SHIFT regression should not treat a numeric value as a special NA class token.
+if shift_continuous and separate_shift_na_from_padding:
+    separate_shift_na_from_padding = False
+    print("[fix] shift_continuous=True -> forcing separate_shift_na_from_padding=False")
 
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
@@ -424,7 +431,7 @@ composite_dtype = np.dtype([
     ('ID', np.uint32),
     ('AGE', np.uint32),
     ('DATA', np.uint32),
-    ('SHIFT', np.uint32),
+    ('SHIFT', np.float32),
     ('TOTAL', np.uint32)
 ])
 
@@ -465,13 +472,21 @@ if shift_continuous and shift_stats.size > 0:
                 "Consider --shift_max_value=-1 (auto) or a tighter cap."
             )
     if shift_max_value <= shift_min_value:
-        p_lo = float(np.percentile(shift_stats, 0.5))
-        p_hi = float(np.percentile(shift_stats, 99.5))
+        p_lo = float(np.percentile(shift_stats, shift_auto_min_percentile))
+        if float(shift_auto_max_percentile) >= 100.0:
+            p_hi = float(shift_stats.max())
+        else:
+            p_hi = float(np.percentile(shift_stats, shift_auto_max_percentile))
         if p_hi <= p_lo:
             p_lo = float(shift_stats.min())
             p_hi = float(shift_stats.max())
         shift_min_value = max(0.0, p_lo)
         shift_max_value = max(shift_min_value + 1.0, p_hi)
+        if master_process:
+            print(
+                f"SHIFT auto-range: p{shift_auto_min_percentile}={p_lo:.4f}, "
+                f"p{shift_auto_max_percentile}={p_hi:.4f}, data_max={float(shift_stats.max()):.4f}"
+            )
     if shift_input_scale <= 0:
         shift_scale_stats = shift_stats
         if shift_log:
