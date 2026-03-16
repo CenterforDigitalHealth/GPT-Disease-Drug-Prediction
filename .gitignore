@@ -14,7 +14,8 @@ ablation/**/.ipynb_checkpoints/
 ablation/**/eval_out/
 ablation/**/train_out/
 ablation/**/logs/
-ablation/hparam_screen/*
-wandb/*
-wandb
+wandb/
 prev_model_ver/
+
+# sampling_trajectories_.ipynb
+# sampling_trajectories_v6.ipynb
