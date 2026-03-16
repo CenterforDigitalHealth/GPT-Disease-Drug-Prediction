@@ -61,12 +61,15 @@ def main() -> None:
     p.add_argument('--data_files', type=str, default='kr_val.bin,kr_test.bin,JMDC_extval.bin')
     p.add_argument('--extra_train_args', type=str, default='')
     p.add_argument('--extra_eval_args', type=str, default='')
+    p.add_argument('--wandb_log', action='store_true', help='Forward wandb_log to train_model')
+    p.add_argument('--wandb_project', type=str, default='composite-delphi', help='Forwarded to train_model')
+    p.add_argument('--wandb_run_name', type=str, default='ablation_loss_normalization', help='Base run name forwarded to train_model (trial suffix added)')
     args = p.parse_args()
 
     flags = _parse_bool_list(args.loss_norm_flags)
 
-    repo = Path(__file__).resolve().parent
-    run_root = (repo / args.output_root / args.run_name).resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+    run_root = (repo_root / args.output_root / args.run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     (run_root / 'ablation_config.json').write_text(json.dumps(vars(args), indent=2), encoding='utf-8')
 
@@ -88,7 +91,13 @@ def main() -> None:
             f'--max_iters={args.max_iters}', f'--eval_interval={args.eval_interval}',
             f'--label_scaling={args.fixed_label_scaling}', f'--loss_normalize_by_variance={flag}'
         ] + extra_train
-        train_sec = _run(train_cmd, repo, env, logs / 'train.log')
+        if args.wandb_log:
+            train_cmd += [
+                '--wandb_log=True',
+                f'--wandb_project={args.wandb_project}',
+                f'--wandb_run_name={args.wandb_run_name}_{trial_name}',
+            ]
+        train_sec = _run(train_cmd, repo_root, env, logs / 'train.log')
 
         eval_cmd = [
             sys.executable, '-m', 'evaluate_auc', f'--input_path={args.input_path}',
@@ -96,7 +105,7 @@ def main() -> None:
             f'--dataset_subset_size={args.dataset_subset_size}', f'--eval_batch_size={args.eval_batch_size}',
             f'--data_files={args.data_files}', f'--posthoc_calibration={args.fixed_posthoc_calibration}'
         ] + extra_eval
-        eval_sec = _run(eval_cmd, repo, env, logs / 'eval.log')
+        eval_sec = _run(eval_cmd, repo_root, env, logs / 'eval.log')
 
         metrics = _load_metrics(eval_out)
         row: Dict[str, object] = {
