@@ -64,8 +64,8 @@ def main() -> None:
     if bad:
         raise ValueError(f'Unknown label scaling: {bad}')
 
-    repo = Path(__file__).resolve().parent
-    run_root = (repo / args.output_root / args.run_name).resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+    run_root = (repo_root / args.output_root / args.run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
     (run_root / 'ablation_config.json').write_text(json.dumps(vars(args), indent=2), encoding='utf-8')
 
@@ -94,7 +94,7 @@ def main() -> None:
                 f'--wandb_project={args.wandb_project}',
                 f'--wandb_run_name={args.wandb_run_name}_{trial_name}',
             ]
-        train_sec = _run(train_cmd, repo, env, logs / 'train.log')
+        train_sec = _run(train_cmd, repo_root, env, logs / 'train.log')
 
         eval_cmd = [
             sys.executable, '-m', 'evaluate_auc', f'--input_path={args.input_path}',
@@ -103,7 +103,7 @@ def main() -> None:
             f'--eval_batch_size={args.eval_batch_size}', f'--data_files={args.data_files}',
             f'--posthoc_calibration={args.fixed_posthoc_calibration}'
         ] + extra_eval
-        eval_sec = _run(eval_cmd, repo, env, logs / 'eval.log')
+        eval_sec = _run(eval_cmd, repo_root, env, logs / 'eval.log')
 
         metrics = _load_metrics(eval_out)
         row: Dict[str, object] = {
