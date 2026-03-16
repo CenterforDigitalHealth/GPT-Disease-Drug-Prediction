@@ -49,11 +49,21 @@ def compute_waiting_times(model, val_data, val_p2i, device,
 
     # get_batch_composite returns:
     # (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
+    # Read tokenization settings from model config
+    config = getattr(model, 'config', None)
+    apply_ts = bool(getattr(config, 'apply_token_shift', False))
+    shift_cont = bool(getattr(config, 'shift_continuous', False))
+    sep_na = bool(getattr(config, 'separate_shift_na_from_padding', False))
+    na_tok = int(getattr(config, 'shift_na_raw_token', 4))
+
     batch = get_batch_composite(
         batch_indices, val_data, val_p2i,
         select='left', padding='random',
         block_size=block_size, device=device,
-        apply_token_shift=True,
+        apply_token_shift=apply_ts,
+        shift_continuous=shift_cont,
+        separate_shift_na_from_padding=sep_na,
+        shift_na_raw_token=na_tok,
     )
 
     x_data, x_shift, x_total, x_ages = batch[0], batch[1], batch[2], batch[3]
@@ -138,9 +148,9 @@ def draw_waiting_time_plot(expected_t, t_observed, bin_centers, bin_means,
     ax = plt.gca()
     ax.set_aspect('equal')
 
-    ax.scatter(expected_t, t_observed + 0.5, marker='.', c='lightgrey',
-               rasterized=True, label='Observed')
-    ax.plot(bin_centers, bin_means, label='Average', color='tab:blue')
+    ax.scatter(expected_t, t_observed + 0.5, marker='.', c='steelblue',
+               alpha=0.15, s=3, rasterized=True, label='Observed')
+    ax.plot(bin_centers, bin_means, label='Average', color='tab:red', lw=2)
     ax.plot([0, 1], [0, 1], transform=ax.transAxes,
             c='k', ls=(0, (5, 5)), lw=0.7)
 

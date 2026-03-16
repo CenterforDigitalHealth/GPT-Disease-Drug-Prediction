@@ -145,7 +145,17 @@ def gpu_worker(gpu_id, patient_indices, queue, ckpt_path, data_root, block_size,
 
     # Load validation dataset
     checkpoint = torch.load(ckpt_path, map_location=device)
-    conf = CompositeDelphiConfig(**checkpoint['model_args'])
+    model_args = dict(checkpoint['model_args'])
+    eval_apply_token_shift = False  # must match get_batch_composite below
+    if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
+        model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
+        model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288
+        print(
+            f"[GPU {gpu_id}] Checkpoint missing drug token range; using fallback "
+            f"[{model_args['drug_token_min']}, {model_args['drug_token_max']}] "
+            f"(apply_token_shift={eval_apply_token_shift})."
+        )
+    conf = CompositeDelphiConfig(**model_args)
     model = CompositeDelphi(conf)
     state_dict = checkpoint['model']
     unwanted_prefix = '_orig_mod.'
@@ -194,7 +204,7 @@ def gpu_worker(gpu_id, patient_indices, queue, ckpt_path, data_root, block_size,
             padding='random',
             no_event_token_rate=0,
             cut_batch=True,
-            apply_token_shift=False,
+            apply_token_shift=eval_apply_token_shift,
         )
         x_data, x_shift, x_total, x_ages = batch[0], batch[1], batch[2], batch[3]
         y_data, y_ages = batch[4], batch[7]

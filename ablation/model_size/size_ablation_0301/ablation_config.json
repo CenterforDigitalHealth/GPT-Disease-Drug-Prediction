@@ -1,0 +1,16 @@
+{
+  "gpu_ids": "0,1,2,3,4",
+  "input_path": "../data",
+  "output_root": "ablation/model_size",
+  "run_name": "size_ablation_0301",
+  "scales": "small,medium,large",
+  "max_iters": 10000,
+  "eval_interval": 2000,
+  "dataset_subset_size": 10000,
+  "eval_batch_size": 64,
+  "data_files": "kr_val.bin,kr_test.bin,JMDC_extval.bin",
+  "extra_train_args": "",
+  "extra_eval_args": "",
+  "skip_train": false,
+  "skip_eval": false
+}

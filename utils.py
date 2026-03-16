@@ -4,7 +4,8 @@ import re
 
 def get_batch_composite(ix, data, p2i, select='center', index='patient', padding='regular',
                         block_size=48, device='cpu', lifestyle_augmentations=False,
-                        no_event_token_rate=5, cut_batch=False, apply_token_shift=True):
+                        no_event_token_rate=5, cut_batch=False, apply_token_shift=True,
+                        shift_continuous=False, separate_shift_na_from_padding=False, shift_na_raw_token=4):
     """
     Get a batch of composite data (DATA, SHIFT, TOTAL) from the dataset.
     
@@ -21,6 +22,12 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         no_event_token_rate: average rate of "no event" tokens in years
         cut_batch: whether to cut the batch to the smallest size possible
         apply_token_shift: whether to shift tokens by +1 to reserve 0 for padding
+        shift_continuous: whether SHIFT is continuous regression target
+        separate_shift_na_from_padding: when True, remap raw SHIFT==0 (N/A) to
+            shift_na_raw_token before synthetic no-event insertion. This keeps
+            no-event/padding(0) distinct from real N/A in SHIFT.
+        shift_na_raw_token: raw SHIFT token id used for N/A remapping when
+            separate_shift_na_from_padding=True (default: 4)
 
     Returns:
         x_data: input DATA tokens (B, T)
@@ -64,7 +71,10 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
 
     # Extract all fields
     data_tokens = torch.from_numpy(data['DATA'][batch_idx].astype(np.int64))
-    shift_values = torch.from_numpy(data['SHIFT'][batch_idx].astype(np.int64))
+    if shift_continuous:
+        shift_values = torch.from_numpy(data['SHIFT'][batch_idx].astype(np.float32))
+    else:
+        shift_values = torch.from_numpy(data['SHIFT'][batch_idx].astype(np.int64))
     total_values = torch.from_numpy(data['TOTAL'][batch_idx].astype(np.int64))
     ages = torch.from_numpy(data['AGE'][batch_idx].astype(np.float32))
 
@@ -73,6 +83,12 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     shift_values = shift_values.masked_fill(~mask, -1)
     total_values = total_values.masked_fill(~mask, -1)
     ages = ages.masked_fill(~mask, mask_time)
+
+    # Optional: keep real SHIFT N/A (raw 0) distinct from no-event/padding (0).
+    # Apply only to real rows (mask=True), before inserting synthetic no-event tokens.
+    if separate_shift_na_from_padding and not shift_continuous:
+        na_mask = (shift_values == 0) & mask
+        shift_values = shift_values.masked_fill(na_mask, int(shift_na_raw_token))
 
     # Insert "no event" tokens
     if (padding.lower() == 'none' or
@@ -97,7 +113,11 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         data_tokens,
         torch.full((len(ix), n_pad), no_event_token, dtype=torch.long),
     ])
-    shift_values = torch.hstack([shift_values, torch.full((len(ix), n_pad), no_event_token, dtype=torch.long)])
+    if shift_continuous:
+        shift_pad = torch.full((len(ix), n_pad), float(no_event_token), dtype=torch.float32)
+    else:
+        shift_pad = torch.full((len(ix), n_pad), no_event_token, dtype=torch.long)
+    shift_values = torch.hstack([shift_values, shift_pad])
     total_values = torch.hstack([total_values, torch.full((len(ix), n_pad), no_event_token, dtype=torch.long)])
     ages = torch.hstack([ages, pad])
 
@@ -117,12 +137,14 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     # Shift tokens by 1 (0 is reserved for padding)
     if apply_token_shift:
         data_tokens = data_tokens + 1
-        shift_values = shift_values + 1
         total_values = total_values + 1
+        if not shift_continuous:
+            shift_values = shift_values + 1
     else:
         data_tokens = data_tokens.clamp_min(0)
-        shift_values = shift_values.clamp_min(0)
         total_values = total_values.clamp_min(0)
+        if not shift_continuous:
+            shift_values = shift_values.clamp_min(0)
 
     # Cut padded tokens if possible
     if cut_batch:

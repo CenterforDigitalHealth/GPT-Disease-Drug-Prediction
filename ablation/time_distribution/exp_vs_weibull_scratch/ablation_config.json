@@ -1,0 +1,15 @@
+{
+  "gpu_ids": "0,1,2,3",
+  "input_path": "../data",
+  "output_root": "ablation/time_distribution",
+  "run_name": "exp_vs_weibull_scratch",
+  "max_iters": 10000,
+  "eval_interval": 2000,
+  "dataset_subset_size": 10000,
+  "eval_batch_size": 64,
+  "data_files": "kr_val.bin,kr_test.bin",
+  "extra_train_args": "",
+  "extra_eval_args": "",
+  "skip_train": false,
+  "skip_eval": false
+}

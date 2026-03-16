@@ -48,24 +48,16 @@ class AdvancedXAIAnalyzer:
             return None
         
         x_data, x_shift, x_total, x_ages = batch[:4]
-        y_data, y_shift, y_total, y_ages = batch[4], batch[5], batch[6], batch[7]
         x_data = x_data.to(self.device)
         x_shift = x_shift.to(self.device)
         x_total = x_total.to(self.device)
         x_ages = x_ages.to(self.device)
-        y_data = y_data.to(self.device)
-        y_shift = y_shift.to(self.device)
-        y_total = y_total.to(self.device)
-        y_ages = y_ages.to(self.device)
         
-        # Forward pass - CompositeDelphi returns (logits_dict, loss_dict, att)
+        # Forward pass WITHOUT targets → model_v2 collects attention weights
+        # (model_v2 skips att collection when is_training=True i.e. targets_data is not None)
         with torch.no_grad():
             logits, _, att = self.model(
                 x_data, x_shift, x_total, x_ages,
-                targets_data=y_data,
-                targets_shift=y_shift,
-                targets_total=y_total,
-                targets_age=y_ages
             )
         
         # att is a stacked tensor of attention weights from all layers
@@ -304,14 +296,18 @@ class AdvancedXAIAnalyzer:
         y_total = y_total[sample_idx:sample_idx+1].to(self.device)
         y_ages = y_ages[sample_idx:sample_idx+1].to(self.device)
         
-        # Get predictions
+        # Get predictions (with targets for drug_cond)
         with torch.no_grad():
-            logits, _, att = self.model(
+            logits, _, _ = self.model(
                 x_data, x_shift, x_total, x_ages,
                 targets_data=y_data,
                 targets_shift=y_shift,
                 targets_total=y_total,
                 targets_age=y_ages
+            )
+            # Separate pass without targets to get attention weights
+            _, _, att = self.model(
+                x_data, x_shift, x_total, x_ages,
             )
         
         # Extract predictions from dict
@@ -384,11 +380,16 @@ class AdvancedXAIAnalyzer:
         ax3 = fig.add_subplot(gs[1, 1])
         shift_probs_np = shift_probs.cpu().numpy()[0]
         
-        # SHIFT classes (with apply_token_shift):
-        # 0=Pad, 1=Non-Drug, 2=Decrease, 3=Maintain, 4=Increase
-        class_names = ['Pad', 'Non-Drug', 'Decrease', 'Maintain', 'Increase']
-        class_names = class_names[:len(shift_probs_np)]
-        colors = ['gray', 'lightgray', 'salmon', 'lightgreen', 'orange'][:len(shift_probs_np)]
+        # Auto-detect: binary (model_v2) vs multi-class
+        if len(shift_probs_np) == 2:
+            # Binary: Maintain vs Changed
+            class_names = ['Maintain', 'Changed']
+            colors = ['lightgreen', 'salmon']
+        else:
+            # Multi-class (5): 0=Pad, 1=Non-Drug, 2=Decrease, 3=Maintain, 4=Increase
+            class_names = ['Pad', 'Non-Drug', 'Decrease', 'Maintain', 'Increase']
+            class_names = class_names[:len(shift_probs_np)]
+            colors = ['gray', 'lightgray', 'salmon', 'lightgreen', 'orange'][:len(shift_probs_np)]
         
         bars = ax3.bar(class_names[:len(shift_probs_np)], shift_probs_np, color=colors, alpha=0.7)
         ax3.set_title('Shift Prediction Probabilities', fontweight='bold')
@@ -430,7 +431,10 @@ class AdvancedXAIAnalyzer:
         
         summary_text = "Prediction Summary:\n\n"
         
-        class_map = {0: 'Pad', 1: 'Non-Drug', 2: 'Decrease', 3: 'Maintain', 4: 'Increase'}
+        if len(shift_probs_np) == 2:
+            class_map = {0: 'Maintain', 1: 'Changed'}
+        else:
+            class_map = {0: 'Pad', 1: 'Non-Drug', 2: 'Decrease', 3: 'Maintain', 4: 'Increase'}
         predicted_shift_class = predicted_class
         true_shift_class = y_shift.cpu().numpy()[0, -1]
         
@@ -647,32 +651,42 @@ class AdvancedXAIAnalyzer:
         ax2.set_title('Position Variability (Proxy for Importance)')
         ax2.grid(True, alpha=0.3, axis='y')
         
-        # 3. Shift prediction distribution by position (drug events only: 2,3,4)
+        # 3. Shift prediction distribution by position
         ax3 = axes[1, 0]
         
-        # For each position, see if certain shift predictions are more common
-        shift_by_position = []
-        drug_classes = [2, 3, 4]  # Decrease, Maintain, Increase
-        for pos in range(min(seq_len, 20)):  # Limit positions
-            # Only count drug-class predictions (exclude Pad=0, Non-Drug=1)
-            preds_col = all_shift_preds[:, 0]
-            drug_mask = np.isin(preds_col, drug_classes)
-            if drug_mask.sum() > 0:
-                counts_per_class = [np.sum(preds_col[drug_mask] == c) for c in drug_classes]
-                total = sum(counts_per_class)
-                shift_by_position.append([c / total for c in counts_per_class])
+        # Auto-detect: binary (0/1) vs multi-class (2/3/4)
+        unique_preds = np.unique(all_shift_preds[all_shift_preds >= 0])
+        if unique_preds.max() <= 1:
+            # Binary model: 0=Maintain, 1=Changed
+            shift_classes = [0, 1]
+            shift_labels = ['Maintain', 'Changed']
+            shift_colors = ['lightgreen', 'salmon']
+        else:
+            # Multi-class: 2=Decrease, 3=Maintain, 4=Increase (or 1,2,3 if no token shift)
+            if np.isin([2, 3, 4], unique_preds).any():
+                shift_classes = [2, 3, 4]
             else:
-                shift_by_position.append([0, 0, 0])
+                shift_classes = [1, 2, 3]
+            shift_labels = ['Decrease', 'Maintain', 'Increase']
+            shift_colors = ['salmon', 'lightgreen', 'orange']
+        
+        shift_by_position = []
+        for pos in range(min(seq_len, 20)):
+            preds_col = all_shift_preds[:, 0]
+            valid_mask = np.isin(preds_col, shift_classes)
+            if valid_mask.sum() > 0:
+                counts_per_class = [np.sum(preds_col[valid_mask] == c) for c in shift_classes]
+                total = sum(counts_per_class)
+                shift_by_position.append([c / max(total, 1) for c in counts_per_class])
+            else:
+                shift_by_position.append([0] * len(shift_classes))
         
         # Plot stacked bar
         if shift_by_position:
-            shift_array = np.array(shift_by_position).T  # (3, n_positions)
+            shift_array = np.array(shift_by_position).T
             bottom = np.zeros(len(shift_by_position))
             
-            colors = ['salmon', 'lightgreen', 'orange']
-            labels = ['Decrease', 'Maintain', 'Increase']
-            
-            for i, (color, label) in enumerate(zip(colors, labels)):
+            for i, (color, label) in enumerate(zip(shift_colors, shift_labels)):
                 ax3.bar(range(len(shift_by_position)), shift_array[i], 
                        bottom=bottom, color=color, alpha=0.7, label=label)
                 bottom += shift_array[i]
