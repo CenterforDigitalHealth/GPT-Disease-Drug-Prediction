@@ -465,6 +465,14 @@ def main() -> None:
         default=1,
         help="Resume from this trial id (inclusive). Existing rows with smaller trial_id are kept.",
     )
+    parser.add_argument(
+        "--retry_eval_from_existing_ckpt",
+        action="store_true",
+        help=(
+            "Retry eval from previously trained checkpoints without retraining. "
+            "When enabled, all trials with existing ckpt are re-evaluated (no skip)."
+        ),
+    )
 
     parser.add_argument("--max_iters", type=int, default=3000, help="Train max iterations per trial")
     parser.add_argument("--eval_interval", type=int, default=500, help="Train eval interval")
@@ -473,7 +481,7 @@ def main() -> None:
     parser.add_argument(
         "--data_files",
         type=str,
-        default="dose/kr_val.bin,dose/kr_test.bin,dose/JMDC_exval2.bin",
+        default="dose/kr_val.bin,dose/kr_test.bin,dose/JMDC_extval.bin,UKB_extval.bin",
         help="Comma-separated eval files for evaluate_auc_v6",
     )
 
@@ -553,6 +561,11 @@ def main() -> None:
     print(f"Valid combinations: {len(valid_combos)}", flush=True)
     print(f"Sampled trials: {len(specs)} (sample_seed={args.sample_seed})", flush=True)
     print(f"Resume from trial id: {args.resume_from_trial_id}", flush=True)
+    if args.retry_eval_from_existing_ckpt:
+        print(
+            "Eval retry mode: enabled (reuse existing ckpt and rerun eval on all matching trials)",
+            flush=True,
+        )
     print(
         "Forced options: shift_continuous=True, shift_log=True",
         flush=True,
@@ -575,20 +588,27 @@ def main() -> None:
 
     trials_csv = run_root / "trials.csv"
     existing_rows = _load_existing_trials(trials_csv)
-    trial_rows: List[Dict[str, object]] = [
-        r for r in existing_rows if int(r.get("trial_id", 0)) < args.resume_from_trial_id
-    ]
+    sampled_ids = {s.trial_id for s in specs}
+    trial_rows_by_id: Dict[int, Dict[str, object]] = {
+        int(r.get("trial_id", 0)): dict(r)
+        for r in existing_rows
+        if int(r.get("trial_id", 0)) in sampled_ids
+    }
     if existing_rows:
+        kept_before_resume = sum(
+            1
+            for tid in trial_rows_by_id.keys()
+            if tid < args.resume_from_trial_id
+        )
         print(
             f"Existing trials.csv detected: {len(existing_rows)} rows "
-            f"(keeping {len(trial_rows)} rows with trial_id < {args.resume_from_trial_id})",
+            f"(loaded {len(trial_rows_by_id)} sampled rows, "
+            f"{kept_before_resume} rows with trial_id < {args.resume_from_trial_id})",
             flush=True,
         )
 
     total_trials = len(specs)
     for trial_idx, spec in enumerate(specs, start=1):
-        if spec.trial_id < args.resume_from_trial_id:
-            continue
         trial_root = run_root / f"trial_{spec.trial_id:03d}"
         train_out = trial_root / "train_out"
         eval_out = trial_root / "eval_out"
@@ -596,10 +616,38 @@ def main() -> None:
         train_log = logs_dir / "train.log"
         eval_log = logs_dir / "eval.log"
         ckpt_path = train_out / "ckpt.pt"
+        existing_ckpt = _resolve_checkpoint(train_out)
+        existing_row = trial_rows_by_id.get(spec.trial_id)
+        retry_eval_this_trial = (
+            args.retry_eval_from_existing_ckpt
+            and existing_ckpt is not None
+            and spec.trial_id >= args.resume_from_trial_id
+        )
+
+        if spec.trial_id < args.resume_from_trial_id and not retry_eval_this_trial:
+            continue
+
+        if (
+            args.retry_eval_from_existing_ckpt
+            and args.skip_train
+            and spec.trial_id >= args.resume_from_trial_id
+            and existing_ckpt is None
+        ):
+            print(
+                (
+                    f"\n[trial {trial_idx}/{total_trials}] SKIP "
+                    f"(id={spec.trial_id:03d}) no existing checkpoint "
+                    "(retry mode + --skip_train)."
+                ),
+                flush=True,
+            )
+            continue
+
+        start_tag = "RETRY-EVAL" if retry_eval_this_trial else "START"
 
         print(
             (
-                f"\n[trial {trial_idx}/{total_trials}] START "
+                f"\n[trial {trial_idx}/{total_trials}] {start_tag} "
                 f"(id={spec.trial_id:03d}) "
                 f"block_size={spec.block_size}, n_embd={spec.n_embd}, "
                 f"n_layer={spec.n_layer}, n_head={spec.n_head}, "
@@ -608,7 +656,13 @@ def main() -> None:
             flush=True,
         )
 
-        row: Dict[str, object] = {
+        row: Dict[str, object] = dict(existing_row) if existing_row is not None else {}
+        for k in list(row.keys()):
+            # Clear stale flattened metrics before re-evaluation.
+            if "." in k:
+                row.pop(k, None)
+
+        row.update({
             "trial_id": spec.trial_id,
             "status": "running",
             "error_message": "",
@@ -628,14 +682,22 @@ def main() -> None:
             "checkpoint_path": str(ckpt_path),
             "train_log": str(train_log),
             "eval_log": str(eval_log),
-        }
+        })
 
         t_total0 = time.time()
         train_seconds = 0.0
         eval_seconds = 0.0
 
         try:
-            if not args.skip_train:
+            if retry_eval_this_trial:
+                print(
+                    (
+                        f"[trial {trial_idx}/{total_trials}] Reusing existing checkpoint "
+                        f"for eval retry: {existing_ckpt}"
+                    ),
+                    flush=True,
+                )
+            elif not args.skip_train:
                 print(
                     f"[trial {trial_idx}/{total_trials}] Training... (log: {train_log})",
                     flush=True,
@@ -672,7 +734,7 @@ def main() -> None:
                     flush=True,
                 )
 
-            resolved_ckpt = _resolve_checkpoint(train_out)
+            resolved_ckpt = existing_ckpt if retry_eval_this_trial else _resolve_checkpoint(train_out)
             if resolved_ckpt is None:
                 raise FileNotFoundError(
                     f"Checkpoint not found under {train_out} "
@@ -751,7 +813,8 @@ def main() -> None:
             row["train_seconds"] = float(train_seconds)
             row["eval_seconds"] = float(eval_seconds)
             row["total_seconds"] = float(time.time() - t_total0)
-            trial_rows.append(row)
+            trial_rows_by_id[spec.trial_id] = row
+            trial_rows = [trial_rows_by_id[tid] for tid in sorted(trial_rows_by_id.keys())]
             _write_csv(trial_rows, trials_csv)
             ok = sum(1 for r in trial_rows if str(r.get("status", "")) == "success")
             fail = len(trial_rows) - ok
@@ -760,6 +823,8 @@ def main() -> None:
                 f"(success={ok}, failed={fail})",
                 flush=True,
             )
+
+    trial_rows = [trial_rows_by_id[tid] for tid in sorted(trial_rows_by_id.keys())]
 
     # Pick best trial
     best_idx = _pick_best_trial(trial_rows)

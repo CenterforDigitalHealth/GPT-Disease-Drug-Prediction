@@ -13,6 +13,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib.lines as mlines
 
+plt.rcParams['font.family'] = 'Helvetica'
+
 # Ensure project root is importable
 _here = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(os.path.dirname(_here))
@@ -98,15 +100,10 @@ def get_embeddings(ckpt_path, token_meta):
     embeddings : np.ndarray  (n_tokens, n_embd)
     valid_token_ids : list[int]
     """
-    from model import CompositeDelphi, CompositeDelphiConfig
+    from figutils.common import load_model
 
     print(f"[INFO] Loading embeddings from {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location='cpu')
-    config = CompositeDelphiConfig(**ckpt['model_args'])
-    model = CompositeDelphi(config)
-
-    sd = {k.replace('_orig_mod.', ''): v for k, v in ckpt['model'].items()}
-    model.load_state_dict(sd)
+    model, ckpt = load_model(ckpt_path, device='cpu')
 
     full_emb = model.composite_emb.data_emb.weight.detach().numpy()
     valid_ids = sorted(token_meta.keys())
@@ -130,7 +127,7 @@ def run_umap(embeddings, n_neighbors=15, min_dist=0.1, metric='cosine'):
 def draw_umap_plot(embedding_2d, valid_token_ids, token_meta,
                    token_counts, legend_info,
                    target_label_ids=None, size_levels=None,
-                   figsize=(18, 14), save_path=None):
+                   figsize=(8, 6), save_path=None):
     """
     Render a UMAP scatter plot.
 

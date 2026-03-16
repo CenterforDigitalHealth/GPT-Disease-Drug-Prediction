@@ -9,10 +9,12 @@ out/*
 .ipynb_checkpoints/*
 *.parquet
 *.pt
+*.ttf
 ablation/**/.ipynb_checkpoints/
 ablation/**/eval_out/
 ablation/**/train_out/
 ablation/**/logs/
+ablation/hparam_screen/*
 wandb/*
 wandb
 prev_model_ver/

@@ -27,7 +27,7 @@ COMPOSITE_DTYPE = np.dtype([
     ('ID',    np.uint32),
     ('AGE',   np.uint32),
     ('DATA',  np.uint32),
-    ('SHIFT', np.uint32),
+    ('SHIFT', np.float32),
     ('TOTAL', np.uint32),
 ])
 
@@ -53,12 +53,10 @@ def load_model(ckpt_path, device='cpu', strip_prefix=True):
     checkpoint : dict
         Raw checkpoint dictionary (contains 'model_args', 'iter_num', etc.).
     """
-    from model import CompositeDelphi, CompositeDelphiConfig
+    from model_v6 import CompositeDelphi, CompositeDelphiConfig
 
     print(f"[INFO] Loading model from {ckpt_path} → {device}")
     checkpoint = torch.load(ckpt_path, map_location=device)
-    config = CompositeDelphiConfig(**checkpoint['model_args'])
-    model = CompositeDelphi(config)
 
     state_dict = checkpoint['model']
     if strip_prefix:
@@ -68,7 +66,64 @@ def load_model(ckpt_path, device='cpu', strip_prefix=True):
             for k, v in state_dict.items()
         }
 
-    model.load_state_dict(state_dict)
+    # ── Auto-detect model version from state_dict keys ──
+    # model_v7: MDN shift_head (shift_head.proj.*)      — continuous regression
+    # model_v2: BinaryChangeHead (shift_head.head.*)     — binary classification
+    # model_v3: HierarchicalShiftHead (shift_head.change_head.* + direction_head.*)
+    # model (v1): original Sequential (shift_head.0.weight)
+    has_mdn_shift = any('shift_head.proj.' in k for k in state_dict)
+    has_hierarchical = any('shift_head.change_head' in k for k in state_dict)
+    has_binary_change = any('shift_head.head.' in k for k in state_dict)
+
+    if has_mdn_shift and not has_binary_change:
+        # v7: MDN continuous shift
+        try:
+            from model_v7 import CompositeDelphi, CompositeDelphiConfig
+            print("[INFO] Detected MDN ShiftHead → using model_v7")
+        except ImportError:
+            try:
+                from model_v2 import CompositeDelphi, CompositeDelphiConfig
+                print("[WARN] model_v7 not found, trying model_v2")
+            except ImportError:
+                from model_v6 import CompositeDelphi, CompositeDelphiConfig
+                print("[WARN] model_v7/v2 not found, falling back to model")
+    elif has_binary_change:
+        # v2: BinaryChangeHead
+        try:
+            from model_v2 import CompositeDelphi, CompositeDelphiConfig
+            print("[INFO] Detected BinaryChangeHead → using model_v2")
+        except ImportError:
+            from model_v6 import CompositeDelphi, CompositeDelphiConfig
+            print("[WARN] model_v2 not found, falling back to model")
+    elif has_hierarchical:
+        # v3: HierarchicalShiftHead
+        try:
+            from model_v3 import CompositeDelphi, CompositeDelphiConfig
+            print("[INFO] Detected HierarchicalShiftHead → using model_v3")
+        except ImportError:
+            from model_v6 import CompositeDelphi, CompositeDelphiConfig
+            print("[WARN] model_v3 not found, falling back to model")
+    else:
+        # v1: Original nn.Sequential shift_head
+        from model_v6 import CompositeDelphi, CompositeDelphiConfig
+        print("[INFO] Detected original Sequential ShiftHead → using model")
+
+    # Filter model_args to only include fields defined in CompositeDelphiConfig
+    import dataclasses
+    valid_fields = {f.name for f in dataclasses.fields(CompositeDelphiConfig)}
+    model_args = {k: v for k, v in checkpoint['model_args'].items() if k in valid_fields}
+    skipped = set(checkpoint['model_args']) - valid_fields
+    if skipped:
+        print(f"[WARN] Skipped unknown config fields: {skipped}")
+
+    config = CompositeDelphiConfig(**model_args)
+    model = CompositeDelphi(config)
+
+    result = model.load_state_dict(state_dict, strict=False)
+    if result.missing_keys:
+        print(f"[WARN] Missing keys (initialized randomly): {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"[WARN] Unexpected keys (ignored): {result.unexpected_keys}")
     model.to(device)
     model.eval()
 
@@ -108,43 +163,52 @@ def load_composite_data(data_path):
 
 
 def make_dataloader(data_raw, p2i, block_size=512, batch_size=32,
-                    apply_token_shift=True, max_patients=-1):
+                    apply_token_shift=True, max_patients=-1,
+                    shift_continuous=False, separate_shift_na_from_padding=False,
+                    shift_na_raw_token=4, model=None):
     """
     Create a PyTorch DataLoader for CompositeDelphi evaluation.
 
     Parameters
     ----------
     data_raw : np.ndarray
-        Structured array from load_composite_data.
     p2i : np.ndarray
-        Patient-to-index pointer array.
     block_size : int
-        Maximum sequence length.
     batch_size : int
-        Batch size.
     apply_token_shift : bool
-        Whether to apply token shift (must match training config).
     max_patients : int
-        Limit number of patients (-1 = all).
-
-    Returns
-    -------
-    dataloader : DataLoader
+    shift_continuous : bool
+    separate_shift_na_from_padding : bool
+    shift_na_raw_token : int
+    model : nn.Module, optional
+        If provided, reads config from model to auto-set tokenization params.
     """
     from torch.utils.data import DataLoader, Dataset
-    # Import from project-root utils.py
     from utils import get_batch_composite
+
+    # Auto-read config from model
+    if model is not None:
+        config = getattr(model, 'config', None)
+        if config is not None:
+            apply_token_shift = bool(getattr(config, 'apply_token_shift', apply_token_shift))
+            shift_continuous = bool(getattr(config, 'shift_continuous', shift_continuous))
+            separate_shift_na_from_padding = bool(getattr(config, 'separate_shift_na_from_padding', separate_shift_na_from_padding))
+            shift_na_raw_token = int(getattr(config, 'shift_na_raw_token', shift_na_raw_token))
 
     if 0 < max_patients < len(p2i):
         p2i = p2i[:max_patients]
         print(f"[INFO] Limited to {max_patients} patients")
+
+    _apply_ts = apply_token_shift
+    _shift_cont = shift_continuous
+    _sep_na = separate_shift_na_from_padding
+    _na_tok = shift_na_raw_token
 
     class _Dataset(Dataset):
         def __init__(self):
             self.data = data_raw
             self.p2i = p2i
             self.block_size = block_size
-            self.shift = apply_token_shift
 
         def __len__(self):
             return len(self.p2i)
@@ -159,7 +223,10 @@ def make_dataloader(data_raw, p2i, block_size=512, batch_size=32,
                 padding='none',
                 no_event_token_rate=0,
                 cut_batch=True,
-                apply_token_shift=self.shift,
+                apply_token_shift=_apply_ts,
+                shift_continuous=_shift_cont,
+                separate_shift_na_from_padding=_sep_na,
+                shift_na_raw_token=_na_tok,
             )
 
     def _collate(batch):
