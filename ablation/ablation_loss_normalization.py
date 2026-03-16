@@ -83,7 +83,7 @@ def main() -> None:
         ckpt = train_out / 'ckpt.pt'
 
         train_cmd = [
-            sys.executable, '-m', 'train_model_v6', '--init_from=scratch',
+            sys.executable, '-m', 'train_model', '--init_from=scratch',
             f'--out_dir={train_out}', '--out_dir_use_timestamp=False',
             f'--max_iters={args.max_iters}', f'--eval_interval={args.eval_interval}',
             f'--label_scaling={args.fixed_label_scaling}', f'--loss_normalize_by_variance={flag}'
@@ -91,7 +91,7 @@ def main() -> None:
         train_sec = _run(train_cmd, repo, env, logs / 'train.log')
 
         eval_cmd = [
-            sys.executable, '-m', 'evaluate_auc_v6', f'--input_path={args.input_path}',
+            sys.executable, '-m', 'evaluate_auc', f'--input_path={args.input_path}',
             f'--model_ckpt_path={ckpt}', f'--output_path={eval_out}',
             f'--dataset_subset_size={args.dataset_subset_size}', f'--eval_batch_size={args.eval_batch_size}',
             f'--data_files={args.data_files}', f'--posthoc_calibration={args.fixed_posthoc_calibration}'

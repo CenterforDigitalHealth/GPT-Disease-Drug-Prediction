@@ -75,7 +75,7 @@ def main() -> None:
         eval_out, logs = root / 'eval_out', root / 'logs'
 
         eval_cmd = [
-            sys.executable, '-m', 'evaluate_auc_v6', f'--input_path={args.input_path}',
+            sys.executable, '-m', 'evaluate_auc', f'--input_path={args.input_path}',
             f'--model_ckpt_path={ckpt}', f'--output_path={eval_out}',
             f'--dataset_subset_size={args.dataset_subset_size}', f'--eval_batch_size={args.eval_batch_size}',
             f'--data_files={args.data_files}', f'--posthoc_calibration={cal}'

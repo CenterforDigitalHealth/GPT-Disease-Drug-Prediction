@@ -115,7 +115,7 @@ def _auto_ddp():
 
 _auto_ddp()
 
-from model_v6 import CompositeDelphi, CompositeDelphiConfig
+from model import CompositeDelphi, CompositeDelphiConfig
 from utils import get_p2i_composite, get_batch_composite
 
 # =============================================================================

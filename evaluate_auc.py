@@ -4,7 +4,7 @@ import warnings
 import torch
 # Suppress sklearn warnings about classes not in y_true
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.metrics._classification')
-from model_v6 import CompositeDelphi, CompositeDelphiConfig
+from model import CompositeDelphi, CompositeDelphiConfig
 from tqdm import tqdm
 import pandas as pd
 import numpy as np

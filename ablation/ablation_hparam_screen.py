@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Hyperparameter screening ablation (v6 pipeline).
+Hyperparameter screening ablation.
 
-- Training:   train_model_v6
-- Evaluation: evaluate_auc_v6
+- Training:   train_model
+- Evaluation: evaluate_auc
 
 Screens 5 hyperparameters:
   1) block_size
@@ -450,7 +450,7 @@ def _plot_parallel_coords(rows: List[Dict[str, object]], out_png: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Hyperparameter screening ablation (v6 pipeline)")
+    parser = argparse.ArgumentParser(description="Hyperparameter screening ablation")
     parser.add_argument("--gpu_ids", type=str, default="0,1,2,3", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--input_path", type=str, default="../data", help="Data root for evaluation")
     parser.add_argument("--output_root", type=str, default="ablation/hparam_screen", help="Root output dir")
@@ -482,32 +482,32 @@ def main() -> None:
         "--data_files",
         type=str,
         default="dose/kr_val.bin,dose/kr_test.bin,dose/JMDC_extval.bin,UKB_extval.bin",
-        help="Comma-separated eval files for evaluate_auc_v6",
+        help="Comma-separated eval files for evaluate_auc",
     )
 
     parser.add_argument(
         "--extra_train_args",
         type=str,
         default="",
-        help='Extra args forwarded to train_model_v6.py (e.g. "--batch_size=64")',
+        help='Extra args forwarded to train_model.py (e.g. "--batch_size=64")',
     )
     parser.add_argument(
         "--extra_eval_args",
         type=str,
         default="",
-        help="Extra args forwarded to evaluate_auc_v6.py",
+        help="Extra args forwarded to evaluate_auc.py",
     )
 
     parser.add_argument("--skip_train", action="store_true", help="Skip training")
     parser.add_argument("--skip_eval", action="store_true", help="Skip evaluation")
-    # Forward-only W&B options (same naming as train_model_v6).
-    parser.add_argument("--wandb_log", action="store_true", help="Forward wandb_log to train_model_v6")
-    parser.add_argument("--wandb_project", type=str, default="composite-delphi", help="Forwarded to train_model_v6")
+    # Forward-only W&B options (same naming as train_model).
+    parser.add_argument("--wandb_log", action="store_true", help="Forward wandb_log to train_model")
+    parser.add_argument("--wandb_project", type=str, default="composite-delphi", help="Forwarded to train_model")
     parser.add_argument(
         "--wandb_run_name",
         type=str,
         default="hparam_screen",
-        help="Base run name forwarded to train_model_v6 (trial suffix added)",
+        help="Base run name forwarded to train_model (trial suffix added)",
     )
     args = parser.parse_args()
 
@@ -705,7 +705,7 @@ def main() -> None:
                 train_cmd = [
                     sys.executable,
                     "-m",
-                    "train_model_v6",
+                    "train_model",
                     "--init_from=scratch",
                     "--out_dir_use_timestamp=False",
                     f"--out_dir={train_out}",
@@ -770,7 +770,7 @@ def main() -> None:
                 eval_cmd = [
                     sys.executable,
                     "-m",
-                    "evaluate_auc_v6",
+                    "evaluate_auc",
                     f"--input_path={args.input_path}",
                     f"--model_ckpt_path={ckpt_path}",
                     f"--output_path={eval_out}",
