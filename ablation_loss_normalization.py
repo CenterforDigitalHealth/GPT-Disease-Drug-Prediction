@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Ablation runner for loss variance normalization only."""
+from __future__ import annotations
+
+import argparse, csv, json, os, shlex, subprocess, sys, time
+from pathlib import Path
+from typing import Dict, List
+
+
+def _run(cmd: List[str], cwd: Path, env: Dict[str, str], log_path: Path) -> float:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    t0 = time.time()
+    with log_path.open('w', encoding='utf-8') as f:
+        f.write('$ ' + ' '.join(shlex.quote(c) for c in cmd) + '\n\n')
+        proc = subprocess.run(cmd, cwd=str(cwd), env=env, stdout=f, stderr=subprocess.STDOUT, text=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)} | see {log_path}")
+    return time.time() - t0
+
+
+def _parse_bool_list(raw: str) -> List[bool]:
+    out = []
+    for tok in [x.strip().lower() for x in raw.split(',') if x.strip()]:
+        if tok in {'true', '1', 'yes', 'on'}:
+            out.append(True)
+        elif tok in {'false', '0', 'no', 'off'}:
+            out.append(False)
+        else:
+            raise ValueError(f'Invalid bool token: {tok}')
+    return out
+
+
+def _load_metrics(eval_out: Path) -> Dict[str, Dict]:
+    out: Dict[str, Dict] = {}
+    for fp in sorted(eval_out.glob('*_composite_metrics.json')):
+        out[fp.name.replace('_composite_metrics.json', '')] = json.loads(fp.read_text(encoding='utf-8'))
+    return out
+
+
+def _write_csv(rows: List[Dict[str, object]], path: Path) -> None:
+    keys = sorted({k for r in rows for k in r.keys()})
+    with path.open('w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(rows)
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description='Ablation: loss normalization only')
+    p.add_argument('--gpu_ids', type=str, default='0')
+    p.add_argument('--input_path', type=str, default='../data')
+    p.add_argument('--output_root', type=str, default='ablation/loss_normalization')
+    p.add_argument('--run_name', type=str, default='default')
+    p.add_argument('--loss_norm_flags', type=str, default='false,true')
+    p.add_argument('--fixed_label_scaling', type=str, default='none', choices=['none', 'zscore', 'robust', 'minmax'])
+    p.add_argument('--fixed_posthoc_calibration', type=str, default='none', choices=['none', 'affine'])
+    p.add_argument('--max_iters', type=int, default=10000)
+    p.add_argument('--eval_interval', type=int, default=1000)
+    p.add_argument('--dataset_subset_size', type=int, default=10000)
+    p.add_argument('--eval_batch_size', type=int, default=64)
+    p.add_argument('--data_files', type=str, default='kr_val.bin,kr_test.bin,JMDC_extval.bin')
+    p.add_argument('--extra_train_args', type=str, default='')
+    p.add_argument('--extra_eval_args', type=str, default='')
+    args = p.parse_args()
+
+    flags = _parse_bool_list(args.loss_norm_flags)
+
+    repo = Path(__file__).resolve().parent
+    run_root = (repo / args.output_root / args.run_name).resolve()
+    run_root.mkdir(parents=True, exist_ok=True)
+    (run_root / 'ablation_config.json').write_text(json.dumps(vars(args), indent=2), encoding='utf-8')
+
+    env = os.environ.copy(); env['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
+    extra_train = shlex.split(args.extra_train_args) if args.extra_train_args.strip() else []
+    extra_eval = shlex.split(args.extra_eval_args) if args.extra_eval_args.strip() else []
+
+    rows: List[Dict[str, object]] = []
+
+    for i, flag in enumerate(flags, 1):
+        trial_name = f't{i:02d}_loss_norm-{int(flag)}'
+        root = run_root / trial_name
+        train_out, eval_out, logs = root / 'train_out', root / 'eval_out', root / 'logs'
+        ckpt = train_out / 'ckpt.pt'
+
+        train_cmd = [
+            sys.executable, '-m', 'train_model_v6', '--init_from=scratch',
+            f'--out_dir={train_out}', '--out_dir_use_timestamp=False',
+            f'--max_iters={args.max_iters}', f'--eval_interval={args.eval_interval}',
+            f'--label_scaling={args.fixed_label_scaling}', f'--loss_normalize_by_variance={flag}'
+        ] + extra_train
+        train_sec = _run(train_cmd, repo, env, logs / 'train.log')
+
+        eval_cmd = [
+            sys.executable, '-m', 'evaluate_auc_v6', f'--input_path={args.input_path}',
+            f'--model_ckpt_path={ckpt}', f'--output_path={eval_out}',
+            f'--dataset_subset_size={args.dataset_subset_size}', f'--eval_batch_size={args.eval_batch_size}',
+            f'--data_files={args.data_files}', f'--posthoc_calibration={args.fixed_posthoc_calibration}'
+        ] + extra_eval
+        eval_sec = _run(eval_cmd, repo, env, logs / 'eval.log')
+
+        metrics = _load_metrics(eval_out)
+        row: Dict[str, object] = {
+            'trial_id': i, 'trial_name': trial_name,
+            'label_scaling': args.fixed_label_scaling,
+            'loss_normalize_by_variance': flag,
+            'posthoc_calibration': args.fixed_posthoc_calibration,
+            'train_seconds': round(train_sec, 2), 'eval_seconds': round(eval_sec, 2)
+        }
+        for prefix, m in metrics.items():
+            for k in ('auc_mean', 'shift_rmse_drug_cond', 'shift_r2_drug_cond', 'total_rmse_drug_cond', 'total_r2_drug_cond'):
+                if k in m:
+                    row[f'{prefix}.{k}'] = m[k]
+        rows.append(row)
+        (root / 'trial_summary.json').write_text(json.dumps(row, indent=2), encoding='utf-8')
+        print(f'[done] {trial_name}')
+
+    _write_csv(rows, run_root / 'summary.csv')
+    (run_root / 'summary.json').write_text(json.dumps(rows, indent=2), encoding='utf-8')
+
+
+if __name__ == '__main__':
+    main()

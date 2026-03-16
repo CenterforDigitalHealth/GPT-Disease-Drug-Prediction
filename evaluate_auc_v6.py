@@ -88,6 +88,27 @@ def hierarchical_logits_to_shift_labels(
     return shift_pred
 
 
+def fit_affine_calibration(pred: np.ndarray, target: np.ndarray):
+    """Fit y ~= a * pred + b using least squares."""
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if pred.size == 0 or target.size == 0:
+        return 1.0, 0.0
+    x_mean = float(pred.mean())
+    y_mean = float(target.mean())
+    x_var = float(np.var(pred))
+    if x_var < 1e-12:
+        return 1.0, y_mean - x_mean
+    cov_xy = float(np.mean((pred - x_mean) * (target - y_mean)))
+    a = cov_xy / x_var
+    b = y_mean - a * x_mean
+    return float(a), float(b)
+
+
+def apply_affine_calibration(pred: np.ndarray, a: float, b: float):
+    return a * np.asarray(pred, dtype=np.float64) + b
+
+
 def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
     """
     Computes bootstrapped AUC estimates using PyTorch on CUDA.
@@ -410,7 +431,7 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
     return out
 
 
-def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
+def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc_calibration='none'):
     """
     Evaluate SHIFT, TOTAL predictions for CompositeDelphi v6 model.
     
@@ -618,6 +639,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         all_predictions_total_drug_cond = np.array([])
         all_targets_total_drug_cond = np.array([])
     
+    posthoc_calibration = str(posthoc_calibration).lower()
+
     # Calculate metrics
     results = {}
     
@@ -640,6 +663,16 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         results['shift_std_target'] = float(np.std(shift_target))
         results['shift_std_pred'] = float(np.std(shift_pred))
         results['shift_support'] = int(len(shift_target))
+
+        if posthoc_calibration == 'affine':
+            a_shift, b_shift = fit_affine_calibration(shift_pred, shift_target)
+            shift_pred_cal = apply_affine_calibration(shift_pred, a_shift, b_shift)
+            results['shift_calibration'] = 'affine'
+            results['shift_calibration_a'] = float(a_shift)
+            results['shift_calibration_b'] = float(b_shift)
+            results['shift_mae_calibrated'] = mean_absolute_error(shift_target, shift_pred_cal)
+            results['shift_rmse_calibrated'] = float(np.sqrt(mean_squared_error(shift_target, shift_pred_cal)))
+            results['shift_mean_pred_calibrated'] = float(np.mean(shift_pred_cal))
 
         # Optional interpretability metric for near-discrete targets.
         shift_target_round = np.rint(shift_target)
@@ -706,6 +739,16 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         results[f'{field}_std_target'] = np.std(target)
         results[f'{field}_std_pred'] = np.std(pred)
 
+        if posthoc_calibration == 'affine':
+            a_total, b_total = fit_affine_calibration(pred, target)
+            pred_cal = apply_affine_calibration(pred, a_total, b_total)
+            results[f'{field}_calibration'] = 'affine'
+            results[f'{field}_calibration_a'] = float(a_total)
+            results[f'{field}_calibration_b'] = float(b_total)
+            results[f'{field}_mae_calibrated'] = mean_absolute_error(target, pred_cal)
+            results[f'{field}_rmse_calibrated'] = float(np.sqrt(mean_squared_error(target, pred_cal)))
+            results[f'{field}_mean_pred_calibrated'] = float(np.mean(pred_cal))
+
         # Positive-only regression metrics (targets > 0)
         if len(all_targets_pos[field]) > 0:
             pred_pos = all_predictions_pos[field]
@@ -757,6 +800,7 @@ def evaluate_auc_pipeline(
     n_bootstrap=1,
     meta_info={},
     train_valid_tokens=None,  # Set of tokens present in train data (for filtering)
+    posthoc_calibration='none',
 ):
     """
     Runs the AUC evaluation pipeline.
@@ -1000,7 +1044,7 @@ def evaluate_auc_pipeline(
     if evaluate_composite:
         print("\nEvaluating composite fields (SHIFT, TOTAL)...")
         composite_metrics = evaluate_composite_fields(
-            model, d100k, batch_size=batch_size, device=device
+            model, d100k, batch_size=batch_size, device=device, posthoc_calibration=posthoc_calibration
         )
         
         # Print results
@@ -1021,6 +1065,9 @@ def evaluate_auc_pipeline(
                 print(f"  Rounded Accuracy: {composite_metrics['shift_rounded_accuracy']:.4f}")
             if 'shift_support' in composite_metrics:
                 print(f"  Support: {composite_metrics['shift_support']}")
+            if 'shift_mae_calibrated' in composite_metrics:
+                print(f"  MAE (calibrated): {composite_metrics['shift_mae_calibrated']:.4f}")
+                print(f"  RMSE (calibrated): {composite_metrics['shift_rmse_calibrated']:.4f}")
 
             # Drug-conditioned SHIFT regression metrics (ONLY for configured drug token range)
             if 'shift_mae_drug_cond' in composite_metrics:
@@ -1058,6 +1105,9 @@ def evaluate_auc_pipeline(
                 print(f"  R²: {composite_metrics[f'{field}_r2']:.4f}")
             if f'{field}_mae_pos' in composite_metrics:
                 print(f"  MAE (target>0): {composite_metrics[f'{field}_mae_pos']:.4f} (n={composite_metrics.get(f'{field}_support_pos', 'NA')})")
+            if f'{field}_mae_calibrated' in composite_metrics:
+                print(f"  MAE (calibrated): {composite_metrics[f'{field}_mae_calibrated']:.4f}")
+                print(f"  RMSE (calibrated): {composite_metrics[f'{field}_rmse_calibrated']:.4f}")
             # TOTAL drug-conditioned extras (ONLY for configured drug token range)
             if 'total_mae_drug_cond' in composite_metrics:
                 total_drug_note = composite_metrics.get('total_drug_cond_note', 'Metrics computed only for configured drug token range')
@@ -1139,6 +1189,8 @@ def main():
                         help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin")
     parser.add_argument("--train_data_file", type=str, default="dose/kr_train.bin",
                         help="Train data file to filter valid tokens. Only tokens present in train data will be evaluated.")
+    parser.add_argument("--posthoc_calibration", type=str, default="none", choices=["none", "affine"],
+                        help="Optional post-hoc calibration for regression outputs.")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -1419,6 +1471,7 @@ def main():
             n_bootstrap=args.n_bootstrap,
             meta_info=meta_info,
             train_valid_tokens=train_valid_tokens,
+            posthoc_calibration=args.posthoc_calibration,
         )
         
         df_auc_unpooled, df_auc_merged, composite_metrics = result

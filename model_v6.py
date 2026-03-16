@@ -51,6 +51,19 @@ def _shift_bounds_for_model_space(shift_min: float, shift_max: float, use_log: b
         hi = lo + 1e-6
     return lo, hi
 
+
+def _transform_targets(values: torch.Tensor, method: str, center: float, scale: float, min_value: float, max_value: float) -> torch.Tensor:
+    """Apply configurable label scaling in a numerically safe way."""
+    method = str(method).lower()
+    if method == 'none':
+        return values
+    if method in {'zscore', 'robust'}:
+        return (values - center) / max(scale, 1e-8)
+    if method == 'minmax':
+        denom = max(max_value - min_value, 1e-8)
+        return (values - min_value) / denom
+    raise ValueError(f"Unknown label scaling method: {method}")
+
 def focal_loss_multiclass(
     logits: torch.Tensor,
     targets: torch.Tensor,
@@ -875,8 +888,21 @@ class CompositeDelphiConfig:
     shift_input_scale: float = 1.0
     shift_exclude_na_token: bool = True
     shift_mdn_nll_weight: float = 0.05
+    shift_label_scaling: str = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
+    shift_label_center: float = 0.0
+    shift_label_scale: float = 1.0
+    shift_label_min: float = 0.0
+    shift_label_max: float = 1.0
     total_min_value: float = 0.0
     total_max_value: float = 550.0
+    total_label_scaling: str = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
+    total_label_center: float = 0.0
+    total_label_scale: float = 1.0
+    total_label_min: float = 0.0
+    total_label_max: float = 1.0
+    loss_normalize_by_variance: bool = False
+    shift_loss_variance: float = 1.0
+    total_loss_variance: float = 1.0
     # Backward-compatibility option for legacy non-MDN checkpoints
     total_log_transform: bool = False
     
@@ -1143,6 +1169,11 @@ class CompositeDelphi(nn.Module):
         loss_shift = torch.tensor(0.0, device=device)
         loss_change = torch.tensor(0.0, device=device)
         shift_scale = max(shift_max_model - shift_min_model, 1.0)
+        shift_label_scaling = str(getattr(self.config, 'shift_label_scaling', 'none')).lower()
+        shift_label_center = float(getattr(self.config, 'shift_label_center', 0.0))
+        shift_label_scale = float(getattr(self.config, 'shift_label_scale', 1.0))
+        shift_label_min = float(getattr(self.config, 'shift_label_min', shift_min_model))
+        shift_label_max = float(getattr(self.config, 'shift_label_max', shift_max_model))
         if isinstance(shift_mdn_source, dict):
             shift_pi_logits = shift_mdn_source['pi_logits'].reshape(-1, shift_mdn_source['pi_logits'].size(-1))[shift_valid_mask]
             shift_mu = shift_mdn_source['mu'].reshape(-1, shift_mdn_source['mu'].size(-1))[shift_valid_mask]
@@ -1160,10 +1191,27 @@ class CompositeDelphi(nn.Module):
                     shift_pred_flat = (shift_pi * shift_mu).sum(dim=-1)
                 shift_pred_flat = shift_pred_flat.clamp(min=shift_min_model, max=shift_max_model)
 
+                shift_pred_scaled = _transform_targets(
+                    shift_pred_flat,
+                    shift_label_scaling,
+                    shift_label_center,
+                    shift_label_scale,
+                    shift_label_min,
+                    shift_label_max,
+                )
+                shift_target_scaled = _transform_targets(
+                    shift_target,
+                    shift_label_scaling,
+                    shift_label_center,
+                    shift_label_scale,
+                    shift_label_min,
+                    shift_label_max,
+                )
+
                 # Primary objective for stable continuous regression.
                 loss_reg = F.smooth_l1_loss(
-                    shift_pred_flat,
-                    shift_target,
+                    shift_pred_scaled,
+                    shift_target_scaled,
                     beta=max(0.25 * shift_scale, 0.1),
                 ) / shift_scale
 
@@ -1190,9 +1238,25 @@ class CompositeDelphi(nn.Module):
                 shift_target = _to_shift_model_space(shift_target, shift_log)
                 shift_pred_flat = torch.clamp(shift_pred_flat, min=shift_min_model, max=shift_max_model)
                 shift_target = shift_target.clamp(min=shift_min_model, max=shift_max_model)
-                loss_shift = F.smooth_l1_loss(
+                shift_pred_scaled = _transform_targets(
                     shift_pred_flat,
+                    shift_label_scaling,
+                    shift_label_center,
+                    shift_label_scale,
+                    shift_label_min,
+                    shift_label_max,
+                )
+                shift_target_scaled = _transform_targets(
                     shift_target,
+                    shift_label_scaling,
+                    shift_label_center,
+                    shift_label_scale,
+                    shift_label_min,
+                    shift_label_max,
+                )
+                loss_shift = F.smooth_l1_loss(
+                    shift_pred_scaled,
+                    shift_target_scaled,
                     beta=max(0.25 * shift_scale, 0.1),
                 ) / shift_scale
 
@@ -1202,6 +1266,11 @@ class CompositeDelphi(nn.Module):
         if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
             total_mdn_source = logits['total_mdn_drug_cond']
 
+        total_label_scaling = str(getattr(self.config, 'total_label_scaling', 'none')).lower()
+        total_label_center = float(getattr(self.config, 'total_label_center', 0.0))
+        total_label_scale = float(getattr(self.config, 'total_label_scale', 1.0))
+        total_label_min = float(getattr(self.config, 'total_label_min', 0.0))
+        total_label_max = float(getattr(self.config, 'total_label_max', float(getattr(self.config, 'total_max_value', 550.0))))
         if isinstance(total_mdn_source, dict):
             pi_logits = total_mdn_source['pi_logits'].reshape(-1, total_mdn_source['pi_logits'].size(-1))[pass_tokens]
             mu = total_mdn_source['mu'].reshape(-1, total_mdn_source['mu'].size(-1))[pass_tokens]
@@ -1209,9 +1278,30 @@ class CompositeDelphi(nn.Module):
 
             # Mixture of logistics NLL:
             # log p(y) = logsumexp_k(log pi_k + log Logistic(y|mu_k, s_k))
-            y = total_target.unsqueeze(-1)
-            z = (y - mu) / torch.exp(log_s)
-            log_pdf = -z - log_s - 2.0 * F.softplus(-z)
+            total_target_scaled = _transform_targets(
+                total_target,
+                total_label_scaling,
+                total_label_center,
+                total_label_scale,
+                total_label_min,
+                total_label_max,
+            )
+
+            if total_label_scaling in {'zscore', 'robust'}:
+                affine_scale = max(total_label_scale, 1e-8)
+                mu_scaled = (mu - total_label_center) / affine_scale
+                log_s_scaled = log_s - math.log(affine_scale)
+            elif total_label_scaling == 'minmax':
+                affine_scale = max(total_label_max - total_label_min, 1e-8)
+                mu_scaled = (mu - total_label_min) / affine_scale
+                log_s_scaled = log_s - math.log(affine_scale)
+            else:
+                mu_scaled = mu
+                log_s_scaled = log_s
+
+            y = total_target_scaled.unsqueeze(-1)
+            z = (y - mu_scaled) / torch.exp(log_s_scaled)
+            log_pdf = -z - log_s_scaled - 2.0 * F.softplus(-z)
             log_pi = F.log_softmax(pi_logits, dim=-1)
             log_prob = torch.logsumexp(log_pi + log_pdf, dim=-1)
             nll = -log_prob
@@ -1221,7 +1311,23 @@ class CompositeDelphi(nn.Module):
             total_pred = logits['total'].reshape(-1)[pass_tokens]
             total_scale = float(getattr(self.config, 'total_max_value', 550.0))
             total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
-            loss_total = F.mse_loss(total_pred, total_target) / (total_scale ** 2)
+            total_pred_scaled = _transform_targets(
+                total_pred,
+                total_label_scaling,
+                total_label_center,
+                total_label_scale,
+                total_label_min,
+                total_label_max,
+            )
+            total_target_scaled = _transform_targets(
+                total_target,
+                total_label_scaling,
+                total_label_center,
+                total_label_scale,
+                total_label_min,
+                total_label_max,
+            )
+            loss_total = F.mse_loss(total_pred_scaled, total_target_scaled) / (total_scale ** 2)
         
         # 4. Time-to-Event Loss
         # dt = time difference (days until next event)
@@ -1302,6 +1408,12 @@ class CompositeDelphi(nn.Module):
             loss_time = -(lse.reshape(-1) - torch.exp(lse.reshape(-1) - ldt.reshape(-1)))
             loss_time = torch.mean(loss_time[pass_tokens])
         
+        if bool(getattr(self.config, 'loss_normalize_by_variance', False)):
+            shift_var = max(float(getattr(self.config, 'shift_loss_variance', 1.0)), 1e-8)
+            total_var = max(float(getattr(self.config, 'total_loss_variance', 1.0)), 1e-8)
+            loss_shift = loss_shift / shift_var
+            loss_total = loss_total / total_var
+
         # Weighted sum of losses
         total_loss = (
             self.config.loss_weight_data * loss_data +
