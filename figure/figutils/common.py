@@ -119,6 +119,14 @@ def load_model(ckpt_path, device='cpu', strip_prefix=True):
     config = CompositeDelphiConfig(**model_args)
     model = CompositeDelphi(config)
 
+    # Attach skipped fields to config (e.g., shift_log, total_log_transform)
+    # These are training-time settings needed for display inverse transforms
+    train_config = checkpoint.get('config', {})
+    for k in skipped:
+        val = checkpoint['model_args'].get(k, train_config.get(k))
+        if val is not None:
+            setattr(config, k, val)
+
     result = model.load_state_dict(state_dict, strict=False)
     if result.missing_keys:
         print(f"[WARN] Missing keys (initialized randomly): {result.missing_keys}")

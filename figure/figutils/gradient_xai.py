@@ -383,6 +383,15 @@ class GradientExplainer:
         # True value
         true = (y_shift if target == 'shift' else y_total)[0, pos].item()
 
+        # Inverse log transform for display values
+        # (attribution rankings are unaffected — only pred/true numbers change)
+        if target == 'shift' and bool(getattr(self.config, 'shift_log', False)):
+            pred = float(np.expm1(pred))
+            true = float(np.expm1(true))
+        elif target == 'total' and bool(getattr(self.config, 'total_log_transform', False)):
+            pred = float(np.expm1(pred))
+            true = float(np.expm1(true))
+
         return attr, pos, pred, true
 
     # ------------------------------------------------------------------
