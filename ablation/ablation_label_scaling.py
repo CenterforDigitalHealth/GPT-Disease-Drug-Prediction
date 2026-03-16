@@ -53,6 +53,9 @@ def main() -> None:
     p.add_argument('--data_files', type=str, default='kr_val.bin,kr_test.bin,JMDC_extval.bin')
     p.add_argument('--extra_train_args', type=str, default='')
     p.add_argument('--extra_eval_args', type=str, default='')
+    p.add_argument('--wandb_log', action='store_true', help='Forward wandb_log to train_model')
+    p.add_argument('--wandb_project', type=str, default='composite-delphi', help='Forwarded to train_model')
+    p.add_argument('--wandb_run_name', type=str, default='ablation_label_scaling', help='Base run name forwarded to train_model (trial suffix added)')
     args = p.parse_args()
 
     scalings = _parse_list(args.label_scalings)
@@ -85,6 +88,12 @@ def main() -> None:
             f'--max_iters={args.max_iters}', f'--eval_interval={args.eval_interval}',
             f'--label_scaling={scaling}', f'--loss_normalize_by_variance={loss_norm}'
         ] + extra_train
+        if args.wandb_log:
+            train_cmd += [
+                '--wandb_log=True',
+                f'--wandb_project={args.wandb_project}',
+                f'--wandb_run_name={args.wandb_run_name}_{trial_name}',
+            ]
         train_sec = _run(train_cmd, repo, env, logs / 'train.log')
 
         eval_cmd = [
