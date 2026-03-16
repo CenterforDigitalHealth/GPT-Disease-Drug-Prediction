@@ -178,6 +178,8 @@ shift_auto_min_percentile = 0.5  # used when shift_max_value <= shift_min_value
 shift_auto_max_percentile = 99.5 # set 100.0 to use observed max
 shift_exclude_na_token = True
 shift_mdn_nll_weight = 0.05
+label_scaling = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
+loss_normalize_by_variance = False
 
 # SHIFT legacy imbalance options (kept for compatibility; ignored in continuous mode)
 shift_loss_type = 'dice_focal'      # 'dice_focal', 'focal', 'ce'
@@ -418,6 +420,43 @@ def _remap_shift_to_change_np(shift_values: np.ndarray, shifted: bool) -> np.nda
     out[is_dec | is_inc] = 1
     return out
 
+
+def _compute_label_scaling_stats(values: np.ndarray, strategy: str):
+    """Compute train-set-only scaling stats for ablations."""
+    strategy = str(strategy).lower()
+    values = values.astype(np.float32)
+    if values.size == 0:
+        return {
+            'center': 0.0,
+            'scale': 1.0,
+            'min': 0.0,
+            'max': 1.0,
+            'var': 1.0,
+        }
+
+    out = {
+        'center': 0.0,
+        'scale': 1.0,
+        'min': float(values.min()),
+        'max': float(values.max()),
+        'var': max(float(np.var(values)), 1e-8),
+    }
+    if strategy == 'zscore':
+        out['center'] = float(values.mean())
+        out['scale'] = max(float(values.std()), 1e-8)
+    elif strategy == 'robust':
+        q1, q2, q3 = np.percentile(values, [25.0, 50.0, 75.0])
+        out['center'] = float(q2)
+        out['scale'] = max(float(q3 - q1), 1e-8)
+    elif strategy == 'minmax':
+        out['center'] = out['min']
+        out['scale'] = max(float(out['max'] - out['min']), 1e-8)
+    elif strategy == 'none':
+        pass
+    else:
+        raise ValueError(f"Unknown label_scaling strategy: {strategy}")
+    return out
+
 # 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
 # composite_dtype = np.dtype([
 #     ('ID', '<u4'),
@@ -496,6 +535,26 @@ if shift_continuous and shift_stats.size > 0:
         print(
             f"SHIFT continuous mode: min={shift_min_value:.4f}, max={shift_max_value:.4f}, "
             f"input_scale={shift_input_scale:.4f}, shift_log={shift_log}"
+        )
+
+total_stats = train_data['TOTAL'].astype(np.float32)
+total_valid_stats = total_stats >= 0
+total_stats = total_stats[total_valid_stats]
+
+label_scaling = str(label_scaling).lower()
+shift_scaling_stats = _compute_label_scaling_stats(shift_stats, label_scaling)
+total_scaling_stats = _compute_label_scaling_stats(total_stats, label_scaling)
+
+if master_process:
+    print(
+        f"Label scaling={label_scaling} | "
+        f"SHIFT(center={shift_scaling_stats['center']:.4f}, scale={shift_scaling_stats['scale']:.4f}, var={shift_scaling_stats['var']:.4f}) | "
+        f"TOTAL(center={total_scaling_stats['center']:.4f}, scale={total_scaling_stats['scale']:.4f}, var={total_scaling_stats['var']:.4f})"
+    )
+    if loss_normalize_by_variance:
+        print(
+            f"Loss variance normalization enabled: shift_var={shift_scaling_stats['var']:.6f}, "
+            f"total_var={total_scaling_stats['var']:.6f}"
         )
 
 # Dynamic Class Weighting (SHIFT, legacy discrete mode only)
@@ -596,9 +655,22 @@ model_args = dict(
     shift_input_scale=shift_input_scale,
     shift_exclude_na_token=shift_exclude_na_token,
     shift_mdn_nll_weight=shift_mdn_nll_weight,
+    shift_label_scaling=label_scaling,
+    shift_label_center=shift_scaling_stats['center'],
+    shift_label_scale=shift_scaling_stats['scale'],
+    shift_label_min=shift_scaling_stats['min'],
+    shift_label_max=shift_scaling_stats['max'],
     total_min_value=total_min_value,
     total_max_value=total_max_value,
     total_log_transform=total_log_transform,
+    total_label_scaling=label_scaling,
+    total_label_center=total_scaling_stats['center'],
+    total_label_scale=total_scaling_stats['scale'],
+    total_label_min=total_scaling_stats['min'],
+    total_label_max=total_scaling_stats['max'],
+    loss_normalize_by_variance=loss_normalize_by_variance,
+    shift_loss_variance=shift_scaling_stats['var'],
+    total_loss_variance=total_scaling_stats['var'],
     # Composite-specific
     data_vocab_size=data_vocab_size,
     shift_vocab_size=shift_vocab_size,
@@ -637,7 +709,10 @@ elif init_from == 'resume':
     for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
               'data_vocab_size', 'shift_vocab_size', 'total_vocab_size',
               'shift_min_value', 'shift_max_value', 'shift_continuous',
-              'shift_log', 'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight']:
+              'shift_log', 'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight',
+              'shift_label_scaling', 'shift_label_center', 'shift_label_scale', 'shift_label_min', 'shift_label_max',
+              'total_label_scaling', 'total_label_center', 'total_label_scale', 'total_label_min', 'total_label_max',
+              'loss_normalize_by_variance', 'shift_loss_variance', 'total_loss_variance']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
     if 'shift_log' not in checkpoint_model_args:
