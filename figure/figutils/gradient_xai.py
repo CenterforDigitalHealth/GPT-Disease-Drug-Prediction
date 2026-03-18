@@ -383,14 +383,17 @@ class GradientExplainer:
         # True value
         true = (y_shift if target == 'shift' else y_total)[0, pos].item()
 
-        # Inverse log transform for display values
-        # (attribution rankings are unaffected — only pred/true numbers change)
+        # Inverse log transform for DISPLAY values only.
+        # Model predicts in log space when shift_log=True, but dataloader
+        # returns raw targets (log transform is applied in the training loop).
+        # → pred needs expm1(), true does NOT.
+        def _safe_expm1(v, max_val=20.0):
+            return float(np.expm1(np.clip(v, -max_val, max_val)))
+
         if target == 'shift' and bool(getattr(self.config, 'shift_log', False)):
-            pred = float(np.expm1(pred))
-            true = float(np.expm1(true))
+            pred = _safe_expm1(pred)
         elif target == 'total' and bool(getattr(self.config, 'total_log_transform', False)):
-            pred = float(np.expm1(pred))
-            true = float(np.expm1(true))
+            pred = _safe_expm1(pred)
 
         return attr, pos, pred, true
 
