@@ -1,0 +1,19 @@
+{
+  "gpu_ids": "0,1,2,3,4",
+  "input_path": "../data",
+  "output_root": "ablation/loss_normalization",
+  "run_name": "ab_loss_norm",
+  "loss_norm_flags": "false,true",
+  "fixed_label_scaling": "none",
+  "fixed_posthoc_calibration": "none",
+  "max_iters": 10000,
+  "eval_interval": 1000,
+  "dataset_subset_size": 10000,
+  "eval_batch_size": 64,
+  "data_files": "dose/kr_val.bin,dose/kr_test.bin,dose/JMDC_extval.bin",
+  "extra_train_args": "",
+  "extra_eval_args": "",
+  "wandb_log": true,
+  "wandb_project": "gpt_pred",
+  "wandb_run_name": "ab_loss_norm"
+}

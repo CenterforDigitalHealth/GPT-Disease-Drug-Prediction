@@ -23,24 +23,24 @@ def _is_master():
     return True
 
 
-def _to_shift_model_space(values: torch.Tensor, use_log: bool) -> torch.Tensor:
-    """Map raw SHIFT values to model space (optionally log1p)."""
+def _to_dose_model_space(values: torch.Tensor, use_log: bool) -> torch.Tensor:
+    """Map raw DOSE values to model space (optionally log1p)."""
     if not use_log:
         return values
     return torch.log1p(torch.clamp(values, min=0.0))
 
 
-def _from_shift_model_space(values: torch.Tensor, use_log: bool) -> torch.Tensor:
-    """Map model-space SHIFT values back to raw space."""
+def _from_dose_model_space(values: torch.Tensor, use_log: bool) -> torch.Tensor:
+    """Map model-space DOSE values back to raw space."""
     if not use_log:
         return values
     return torch.expm1(values)
 
 
-def _shift_bounds_for_model_space(shift_min: float, shift_max: float, use_log: bool):
-    """Convert raw SHIFT bounds to model-space bounds."""
-    lo = float(shift_min)
-    hi = float(shift_max)
+def _dose_bounds_for_model_space(dose_min: float, dose_max: float, use_log: bool):
+    """Convert raw DOSE bounds to model-space bounds."""
+    lo = float(dose_min)
+    hi = float(dose_max)
     if not use_log:
         return lo, hi
     lo = max(lo, 0.0)
@@ -484,8 +484,8 @@ class CompositeEmbedding(nn.Module):
     """
     Composite Embedding Layer: 여러 입력 필드를 각각 임베딩하고 투영
     - DATA (약품/질병 코드) -> ID Embedding
-    - SHIFT (시프트 값) -> Shift Embedding
-    - TOTAL (기간) -> Duration Embedding
+    - DOSE (시프트 값) -> Shift Embedding
+    - DURATION (기간) -> Duration Embedding
     
     Concatenation + Projection: 각 필드의 정보를 더 잘 보존
     """
@@ -493,17 +493,17 @@ class CompositeEmbedding(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
-        self.shift_continuous = bool(getattr(config, 'shift_continuous', False))
-        self.shift_log = bool(getattr(config, 'shift_log', False)) and self.shift_continuous
-        self.shift_input_scale = float(getattr(config, 'shift_input_scale', 1.0))
+        self.dose_continuous = bool(getattr(config, 'dose_continuous', False))
+        self.dose_log = bool(getattr(config, 'dose_log', False)) and self.dose_continuous
+        self.dose_input_scale = float(getattr(config, 'dose_input_scale', 1.0))
         
         # 각 필드별 Embedding
         self.data_emb = nn.Embedding(config.data_vocab_size, config.n_embd)
-        self.shift_emb = nn.Embedding(config.shift_vocab_size, config.n_embd)
-        self.total_emb = nn.Embedding(config.total_vocab_size, config.n_embd)
-        if self.shift_continuous:
-            # Continuous SHIFT encoder (scalar -> dense representation)
-            self.shift_value_proj = nn.Sequential(
+        self.dose_emb = nn.Embedding(config.dose_vocab_size, config.n_embd)
+        self.dur_emb = nn.Embedding(config.dur_vocab_size, config.n_embd)
+        if self.dose_continuous:
+            # Continuous DOSE encoder (scalar -> dense representation)
+            self.dose_value_proj = nn.Sequential(
                 nn.Linear(1, config.n_embd),
                 nn.GELU(),
                 nn.Linear(config.n_embd, config.n_embd),
@@ -512,12 +512,12 @@ class CompositeEmbedding(nn.Module):
         # Concatenation → Projection (3*n_embd → n_embd)
         self.proj = nn.Linear(config.n_embd * 3, config.n_embd, bias=False)
         
-    def forward(self, data, shift, total):
+    def forward(self, data, dose, dur):
         """
         Args:
             data: (B, T) DATA tokens
-            shift: (B, T) SHIFT values (정수값)
-            total: (B, T) TOTAL tokens
+            dose: (B, T) DOSE values (정수값)
+            dur: (B, T) DURATION tokens
         Returns:
             combined embedding (B, T, n_embd)
         """
@@ -525,24 +525,24 @@ class CompositeEmbedding(nn.Module):
         data_idx = torch.clamp(data, min=0, max=self.data_emb.num_embeddings - 1)
         data_emb = self.data_emb(data_idx)
         
-        if self.shift_continuous:
-            # SHIFT continuous value encoding
-            scale = self.shift_input_scale if self.shift_input_scale > 0 else 1.0
-            shift_value = shift.float()
-            shift_value = _to_shift_model_space(shift_value, self.shift_log)
-            shift_value = shift_value.unsqueeze(-1) / scale
-            shift_emb = self.shift_value_proj(shift_value)
+        if self.dose_continuous:
+            # DOSE continuous value encoding
+            scale = self.dose_input_scale if self.dose_input_scale > 0 else 1.0
+            dose_value = dose.float()
+            dose_value = _to_dose_model_space(dose_value, self.dose_log)
+            dose_value = dose_value.unsqueeze(-1) / scale
+            dose_emb = self.dose_value_proj(dose_value)
         else:
-            # SHIFT embedding (legacy discrete mode)
-            shift_idx = torch.clamp(shift, min=0, max=self.shift_emb.num_embeddings - 1)
-            shift_emb = self.shift_emb(shift_idx)
+            # DOSE embedding (legacy discrete mode)
+            dose_idx = torch.clamp(dose, min=0, max=self.dose_emb.num_embeddings - 1)
+            dose_emb = self.dose_emb(dose_idx)
         
-        # TOTAL embedding (clamp to valid range)
-        total_idx = torch.clamp(total, min=0, max=self.total_emb.num_embeddings - 1)
-        total_emb = self.total_emb(total_idx)
+        # DURATION embedding (clamp to valid range)
+        dur_idx = torch.clamp(dur, min=0, max=self.dur_emb.num_embeddings - 1)
+        dur_emb = self.dur_emb(dur_idx)
         
         # Concatenate + Project (preserves each field's information better than sum)
-        combined = torch.cat([data_emb, shift_emb, total_emb], dim=-1)  # (B, T, 3*n_embd)
+        combined = torch.cat([data_emb, dose_emb, dur_emb], dim=-1)  # (B, T, 3*n_embd)
         combined = self.proj(combined)  # (B, T, n_embd)
         
         return combined
@@ -550,7 +550,7 @@ class CompositeEmbedding(nn.Module):
 
 class MixtureDensityHead(nn.Module):
     """
-    Mixture of Logistics head for multi-modal TOTAL distribution.
+    Mixture of Logistics head for multi-modal DURATION distribution.
     """
 
     def __init__(self, n_embd: int, n_components: int, min_value: float, max_value: float):
@@ -591,7 +591,7 @@ class MixtureDensityHead(nn.Module):
         k = self.n_components
         pi_logits, mu_raw, log_s = params.split(k, dim=-1)
 
-        # Keep means in valid TOTAL range
+        # Keep means in valid DURATION range
         mu = torch.sigmoid(mu_raw) * (self.max_value - self.min_value) + self.min_value
         # Prevent degenerate ultra-narrow components
         log_s = torch.clamp(log_s, min=-1.0, max=5.0)
@@ -610,14 +610,14 @@ class MultiHeadOutput(nn.Module):
     """
     Multi-Head Output Layer: 각 필드별 예측 헤드
     - DATA Head: 다음 DATA 토큰 예측 (Classification)
-    - SHIFT Head: 다음 SHIFT 값 예측 (Regression, MDN)
-    - TOTAL Head: 다음 TOTAL 값 예측 (Regression, 연속값)
+    - DOSE Head: 다음 DOSE 값 예측 (Regression, MDN)
+    - DURATION Head: 다음 DURATION 값 예측 (Regression, 연속값)
     - Time Head: 다음 이벤트까지의 시간 예측
       - Exponential: scale (λ) parameter만 예측
       - Weibull: scale (λ) + shape (k) parameter 예측
     
     Drug-Conditioned Heads (optional):
-    - 약물(drug) 정보를 조건으로 SHIFT/TOTAL 예측 성능 향상
+    - 약물(drug) 정보를 조건으로 DOSE/DURATION 예측 성능 향상
     - FiLM (Feature-wise Linear Modulation) 방식 사용
     """
     
@@ -625,25 +625,25 @@ class MultiHeadOutput(nn.Module):
         super().__init__()
         self.n_embd = config.n_embd
         self.time_distribution = getattr(config, 'time_distribution', 'exponential')
-        self.shift_continuous = bool(getattr(config, 'shift_continuous', False))
-        self.shift_log = bool(getattr(config, 'shift_log', False)) and self.shift_continuous
+        self.dose_continuous = bool(getattr(config, 'dose_continuous', False))
+        self.dose_log = bool(getattr(config, 'dose_log', False)) and self.dose_continuous
         self.mdn_n_components = int(getattr(config, 'mdn_n_components', 8))
-        self.total_min_value = float(getattr(config, 'total_min_value', 0.0))
-        self.total_max_value = float(getattr(config, 'total_max_value', 550.0))
-        if self.shift_continuous:
-            default_shift_min = 0.0
-            default_shift_max = float(getattr(config, 'total_max_value', 550.0))
+        self.dur_min_value = float(getattr(config, 'dur_min_value', 0.0))
+        self.dur_max_value = float(getattr(config, 'dur_max_value', 550.0))
+        if self.dose_continuous:
+            default_dose_min = 0.0
+            default_dose_max = float(getattr(config, 'dur_max_value', 550.0))
         else:
-            default_shift_min = 2.0 if bool(getattr(config, 'apply_token_shift', False)) else 1.0
-            default_shift_max = 4.0 if bool(getattr(config, 'apply_token_shift', False)) else 3.0
-        shift_min_cfg = float(getattr(config, 'shift_min_value', -1.0))
-        shift_max_cfg = float(getattr(config, 'shift_max_value', -1.0))
-        self.shift_min_value = default_shift_min if shift_min_cfg < 0.0 else shift_min_cfg
-        self.shift_max_value = default_shift_max if shift_max_cfg < 0.0 else shift_max_cfg
-        self.shift_min_value_model, self.shift_max_value_model = _shift_bounds_for_model_space(
-            self.shift_min_value,
-            self.shift_max_value,
-            self.shift_log,
+            default_dose_min = 2.0 if bool(getattr(config, 'apply_token_shift', False)) else 1.0
+            default_dose_max = 4.0 if bool(getattr(config, 'apply_token_shift', False)) else 3.0
+        dose_min_cfg = float(getattr(config, 'dose_min_value', -1.0))
+        dose_max_cfg = float(getattr(config, 'dose_max_value', -1.0))
+        self.dose_min_value = default_dose_min if dose_min_cfg < 0.0 else dose_min_cfg
+        self.dose_max_value = default_dose_max if dose_max_cfg < 0.0 else dose_max_cfg
+        self.dose_min_value_model, self.dose_max_value_model = _dose_bounds_for_model_space(
+            self.dose_min_value,
+            self.dose_max_value,
+            self.dose_log,
         )
         
         # Drug-conditioning option
@@ -652,52 +652,52 @@ class MultiHeadOutput(nn.Module):
         # Heads
         self.data_head = nn.Linear(config.n_embd, config.data_vocab_size, bias=False)
         
-        # SHIFT head: MDN regression (same structure as TOTAL)
-        self.shift_head = MixtureDensityHead(
+        # DOSE head: MDN regression (same structure as DURATION)
+        self.dose_head = MixtureDensityHead(
             n_embd=config.n_embd,
             n_components=self.mdn_n_components,
-            min_value=self.shift_min_value_model,
-            max_value=self.shift_max_value_model,
+            min_value=self.dose_min_value_model,
+            max_value=self.dose_max_value_model,
         )
 
-        # TOTAL head: MDN (Mixture of Logistics)
-        self.total_head = MixtureDensityHead(
+        # DURATION head: MDN (Mixture of Logistics)
+        self.dur_head = MixtureDensityHead(
             n_embd=config.n_embd,
             n_components=self.mdn_n_components,
-            min_value=self.total_min_value,
-            max_value=self.total_max_value,
+            min_value=self.dur_min_value,
+            max_value=self.dur_max_value,
         )
         
         # ============================================================
         # Drug-Conditioned Heads (FiLM style)
-        # 약물 정보로 hidden state를 변조하여 SHIFT/TOTAL 예측
+        # 약물 정보로 hidden state를 변조하여 DOSE/DURATION 예측
         # ============================================================
         if self.use_drug_conditioning:
             # FiLM generator: drug_emb → (gamma, beta) for modulation
-            # SHIFT: drug 조건
-            self.shift_film_generator = nn.Sequential(
+            # DOSE: drug 조건
+            self.dose_film_generator = nn.Sequential(
                 nn.Linear(config.n_embd, config.n_embd),
                 nn.GELU(),
                 nn.Linear(config.n_embd, config.n_embd * 2)  # gamma, beta
             )
-            self.shift_drug_cond_head = MixtureDensityHead(
+            self.dose_drug_cond_head = MixtureDensityHead(
                 n_embd=config.n_embd,
                 n_components=self.mdn_n_components,
-                min_value=self.shift_min_value_model,
-                max_value=self.shift_max_value_model,
+                min_value=self.dose_min_value_model,
+                max_value=self.dose_max_value_model,
             )
             
-            # TOTAL: drug 조건만
-            self.total_film_generator = nn.Sequential(
+            # DURATION: drug 조건만
+            self.dur_film_generator = nn.Sequential(
                 nn.Linear(config.n_embd, config.n_embd),
                 nn.GELU(),
                 nn.Linear(config.n_embd, config.n_embd * 2)  # gamma, beta
             )
-            self.total_drug_cond_head = MixtureDensityHead(
+            self.dur_drug_cond_head = MixtureDensityHead(
                 n_embd=config.n_embd,
                 n_components=self.mdn_n_components,
-                min_value=self.total_min_value,
-                max_value=self.total_max_value,
+                min_value=self.dur_min_value,
+                max_value=self.dur_max_value,
             )
             # Provisional identity init here; reapplied after parent model init.
             self.reset_film_identity()
@@ -713,7 +713,7 @@ class MultiHeadOutput(nn.Module):
     def reset_film_identity(self):
         """Initialize FiLM generators to identity: gamma=1, beta=0."""
         if self.use_drug_conditioning:
-            for film_gen in [self.shift_film_generator, self.total_film_generator]:
+            for film_gen in [self.dose_film_generator, self.dur_film_generator]:
                 last_layer = film_gen[-1]  # Last Linear layer
                 nn.init.zeros_(last_layer.weight)
                 with torch.no_grad():
@@ -722,11 +722,11 @@ class MultiHeadOutput(nn.Module):
                     last_layer.bias[self.n_embd:].zero_()
 
         # MDN heads are sensitive to init; keep spread-out initial components.
-        self.shift_head.reset_mdn_bias()
-        self.total_head.reset_mdn_bias()
+        self.dose_head.reset_mdn_bias()
+        self.dur_head.reset_mdn_bias()
         if self.use_drug_conditioning:
-            self.shift_drug_cond_head.reset_mdn_bias()
-            self.total_drug_cond_head.reset_mdn_bias()
+            self.dose_drug_cond_head.reset_mdn_bias()
+            self.dur_drug_cond_head.reset_mdn_bias()
         
     def forward(self, x, drug_emb=None, drug_token_mask=None):
         """
@@ -740,15 +740,15 @@ class MultiHeadOutput(nn.Module):
         Returns:
             dict of logits/values for each head
         """
-        shift_mdn = self.shift_head(x)
-        total_mdn = self.total_head(x)
-        shift_mean_out = _from_shift_model_space(shift_mdn['mean'], self.shift_log)
+        dose_mdn = self.dose_head(x)
+        dur_mdn = self.dur_head(x)
+        dose_mean_out = _from_dose_model_space(dose_mdn['mean'], self.dose_log)
         output = {
             'data': self.data_head(x),             # (B, T, data_vocab_size) - classification logits
-            'shift': shift_mean_out,               # (B, T) - raw-space point estimate for compatibility
-            'shift_mdn': shift_mdn,                # MDN params for NLL training/sampling
-            'total': total_mdn['mean'],           # (B, T) - point estimate for compatibility
-            'total_mdn': total_mdn,               # MDN params for NLL training/sampling
+            'dose': dose_mean_out,               # (B, T) - raw-space point estimate for compatibility
+            'dose_mdn': dose_mdn,                # MDN params for NLL training/sampling
+            'duration': dur_mdn['mean'],           # (B, T) - point estimate for compatibility
+            'dur_mdn': dur_mdn,               # MDN params for NLL training/sampling
         }
         
         # ============================================================
@@ -756,59 +756,59 @@ class MultiHeadOutput(nn.Module):
         # Only applies when target is a drug token (drug_token_mask=True)
         # ============================================================
         if self.use_drug_conditioning and drug_emb is not None:
-            # SHIFT: FiLM modulation with drug embedding
-            shift_film = self.shift_film_generator(drug_emb)  # (B, T, n_embd*2)
-            shift_gamma, shift_beta = shift_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
-            shift_modulated = shift_gamma * x + shift_beta  # FiLM: γ * x + β
-            shift_drug_mdn = self.shift_drug_cond_head(shift_modulated)
-            shift_drug_cond = _from_shift_model_space(shift_drug_mdn['mean'], self.shift_log)
+            # DOSE: FiLM modulation with drug embedding
+            dose_film = self.dose_film_generator(drug_emb)  # (B, T, n_embd*2)
+            dose_gamma, dose_beta = dose_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
+            dose_modulated = dose_gamma * x + dose_beta  # FiLM: γ * x + β
+            dose_drug_mdn = self.dose_drug_cond_head(dose_modulated)
+            dose_drug_cond = _from_dose_model_space(dose_drug_mdn['mean'], self.dose_log)
             
-            # TOTAL: FiLM modulation with drug embedding
-            total_film = self.total_film_generator(drug_emb)  # (B, T, n_embd*2)
-            total_gamma, total_beta = total_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
-            total_modulated = total_gamma * x + total_beta  # FiLM: γ * x + β
-            total_drug_mdn = self.total_drug_cond_head(total_modulated)
-            total_drug_cond = total_drug_mdn['mean']  # (B, T)
+            # DURATION: FiLM modulation with drug embedding
+            dur_film = self.dur_film_generator(drug_emb)  # (B, T, n_embd*2)
+            dur_gamma, dur_beta = dur_film.chunk(2, dim=-1)  # 각각 (B, T, n_embd)
+            dur_modulated = dur_gamma * x + dur_beta  # FiLM: γ * x + β
+            dur_drug_mdn = self.dur_drug_cond_head(dur_modulated)
+            dur_drug_cond = dur_drug_mdn['mean']  # (B, T)
             
             # Apply drug token masking: only use FiLM output where target is a drug
             if drug_token_mask is not None:
                 # Blend: use FiLM output for drug tokens, standard output otherwise
-                # SHIFT: (B, T)
-                shift_drug_cond_masked = torch.where(
+                # DOSE: (B, T)
+                dose_drug_cond_masked = torch.where(
                     drug_token_mask,  # (B, T)
-                    shift_drug_cond,
-                    output['shift']
+                    dose_drug_cond,
+                    output['dose']
                 )
-                output['shift_drug_cond'] = shift_drug_cond_masked
+                output['dose_drug_cond'] = dose_drug_cond_masked
                 mask_mdn = drug_token_mask.unsqueeze(-1)
-                output['shift_mdn_drug_cond'] = {
-                    'pi_logits': torch.where(mask_mdn, shift_drug_mdn['pi_logits'], output['shift_mdn']['pi_logits']),
-                    'mu': torch.where(mask_mdn, shift_drug_mdn['mu'], output['shift_mdn']['mu']),
-                    'log_s': torch.where(mask_mdn, shift_drug_mdn['log_s'], output['shift_mdn']['log_s']),
-                    'mean': torch.where(mask_mdn.squeeze(-1), shift_drug_mdn['mean'], output['shift_mdn']['mean']),
+                output['dose_mdn_drug_cond'] = {
+                    'pi_logits': torch.where(mask_mdn, dose_drug_mdn['pi_logits'], output['dose_mdn']['pi_logits']),
+                    'mu': torch.where(mask_mdn, dose_drug_mdn['mu'], output['dose_mdn']['mu']),
+                    'log_s': torch.where(mask_mdn, dose_drug_mdn['log_s'], output['dose_mdn']['log_s']),
+                    'mean': torch.where(mask_mdn.squeeze(-1), dose_drug_mdn['mean'], output['dose_mdn']['mean']),
                 }
                 
-                # TOTAL: (B, T)
-                total_drug_cond_masked = torch.where(
+                # DURATION: (B, T)
+                dur_drug_cond_masked = torch.where(
                     drug_token_mask,  # (B, T)
-                    total_drug_cond,
-                    output['total']
+                    dur_drug_cond,
+                    output['duration']
                 )
-                output['total_drug_cond'] = total_drug_cond_masked
+                output['dur_drug_cond'] = dur_drug_cond_masked
                 # MDN params: (B, T, K)
                 mask_mdn = drug_token_mask.unsqueeze(-1)
-                output['total_mdn_drug_cond'] = {
-                    'pi_logits': torch.where(mask_mdn, total_drug_mdn['pi_logits'], output['total_mdn']['pi_logits']),
-                    'mu': torch.where(mask_mdn, total_drug_mdn['mu'], output['total_mdn']['mu']),
-                    'log_s': torch.where(mask_mdn, total_drug_mdn['log_s'], output['total_mdn']['log_s']),
-                    'mean': total_drug_cond_masked,
+                output['dur_mdn_drug_cond'] = {
+                    'pi_logits': torch.where(mask_mdn, dur_drug_mdn['pi_logits'], output['dur_mdn']['pi_logits']),
+                    'mu': torch.where(mask_mdn, dur_drug_mdn['mu'], output['dur_mdn']['mu']),
+                    'log_s': torch.where(mask_mdn, dur_drug_mdn['log_s'], output['dur_mdn']['log_s']),
+                    'mean': dur_drug_cond_masked,
                 }
             else:
                 # No mask: apply FiLM to all positions (backward compatibility)
-                output['shift_drug_cond'] = shift_drug_cond
-                output['shift_mdn_drug_cond'] = shift_drug_mdn
-                output['total_drug_cond'] = total_drug_cond
-                output['total_mdn_drug_cond'] = total_drug_mdn
+                output['dose_drug_cond'] = dose_drug_cond
+                output['dose_mdn_drug_cond'] = dose_drug_mdn
+                output['dur_drug_cond'] = dur_drug_cond
+                output['dur_mdn_drug_cond'] = dur_drug_mdn
         
         # v6 keeps Delphi semantics: time scale uses DATA logits.
         # Expose aliases for compatibility with existing tooling.
@@ -830,20 +830,20 @@ class CompositeDelphiConfig:
     # Vocabulary sizes for each field
     # 
     # Embedding vocab sizes (모든 필드의 embedding에 사용):
-    # - DATA: includes drugs (Metformin~Death, raw 1277-1288) → after +1 shift: 1278-1289 → vocab_size = 1290
-    # - SHIFT: range depends on dataset (need to check actual range)
-    # - TOTAL: range 0-550 → vocab_size = 551
+    # - DATA: includes drugs (Metformin~Death, raw 1277-1288) → after +1 dose: 1278-1289 → vocab_size = 1290
+    # - DOSE: range depends on dataset (need to check actual range)
+    # - DURATION: range 0-550 → vocab_size = 551
     #
     # Head 구조:
     # - DATA Head: Linear(n_embd, 1290) → Softmax + Cross-Entropy (Classification)
-    # - SHIFT Head: MDN regression head (same as TOTAL head structure)
-    # - TOTAL Head: MDN regression head
-    # Note: vocab sizes include +1 for the shift in get_batch_composite (0 reserved for padding)
-    # Drug tokens: raw 1277~1288 → after +1 shift: 1278~1289 → max token 1289
+    # - DOSE Head: MDN regression head (same as DURATION head structure)
+    # - DURATION Head: MDN regression head
+    # Note: vocab sizes include +1 for the dose in get_batch_composite (0 reserved for padding)
+    # Drug tokens: raw 1277~1288 → after +1 dose: 1278~1289 → max token 1289
     data_vocab_size: int = 1290   # DATA embedding & head (Classification) - includes Death token
-    # NOTE: shift_vocab_size is used for SHIFT embedding input space.
-    shift_vocab_size: int = 5
-    total_vocab_size: int = 552   # TOTAL embedding only (Regression head dim=1) - max 551 after +1 shift
+    # NOTE: dose_vocab_size is used for DOSE embedding input space.
+    dose_vocab_size: int = 5
+    dur_vocab_size: int = 552   # DURATION embedding only (Regression head dim=1) - max 551 after +1 dose
     
     # Model architecture
     n_layer: int = 12
@@ -859,7 +859,7 @@ class CompositeDelphiConfig:
     mask_ties: bool = True
     ignore_tokens: list = field(default_factory=lambda: [0])
     
-    # Drug-Conditioning: 약물 정보를 조건으로 SHIFT/TOTAL 예측 성능 향상
+    # Drug-Conditioning: 약물 정보를 조건으로 DOSE/DURATION 예측 성능 향상
     # FiLM (Feature-wise Linear Modulation) 방식 사용
     use_drug_conditioning: bool = False
     
@@ -869,8 +869,8 @@ class CompositeDelphiConfig:
     drug_token_min: int = 1278
     drug_token_max: int = 1288
     apply_token_shift: bool = False
-    separate_shift_na_from_padding: bool = False
-    shift_na_raw_token: int = 4
+    separate_dose_na_from_padding: bool = False
+    dose_na_raw_token: int = 4
 
     # Architecture features
     use_moe: bool = True
@@ -879,51 +879,56 @@ class CompositeDelphiConfig:
     sliding_window: int = 256
     rope_theta: float = 10000.0
     
-    # TOTAL MDN options
+    # DURATION MDN options
     mdn_n_components: int = 8
-    shift_min_value: float = -1.0  # auto: 1(raw) or 2(shifted)
-    shift_max_value: float = -1.0  # auto: 3(raw) or 4(shifted)
-    shift_continuous: bool = True
-    shift_log: bool = False
-    shift_input_scale: float = 1.0
-    shift_exclude_na_token: bool = True
-    shift_mdn_nll_weight: float = 0.05
-    shift_label_scaling: str = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
-    shift_label_center: float = 0.0
-    shift_label_scale: float = 1.0
-    shift_label_min: float = 0.0
-    shift_label_max: float = 1.0
-    total_min_value: float = 0.0
-    total_max_value: float = 550.0
-    total_label_scaling: str = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
-    total_label_center: float = 0.0
-    total_label_scale: float = 1.0
-    total_label_min: float = 0.0
-    total_label_max: float = 1.0
+    dose_min_value: float = -1.0  # auto: 1(raw) or 2(shifted)
+    dose_max_value: float = -1.0  # auto: 3(raw) or 4(shifted)
+    dose_continuous: bool = True
+    dose_log: bool = False
+    dose_input_scale: float = 1.0
+    dose_exclude_na_token: bool = True
+    dose_mdn_nll_weight: float = 0.05
+    dose_label_scaling: str = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
+    dose_label_center: float = 0.0
+    dose_label_scale: float = 1.0
+    dose_label_min: float = 0.0
+    dose_label_max: float = 1.0
+    dur_min_value: float = 0.0
+    dur_max_value: float = 550.0
+    dur_label_scaling: str = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
+    dur_label_center: float = 0.0
+    dur_label_scale: float = 1.0
+    dur_label_min: float = 0.0
+    dur_label_max: float = 1.0
+    # Drug-token-only regression: DOSE/DURATION loss를 약물 토큰 위치에서만 계산
+    # 비약물 토큰(질병 등)의 무의미한 DURATION/DOSE 값이 MDN 학습을 희석하는 문제 해결
+    drug_token_only_regression: bool = False
+    # Drug-token loss에 추가 가중치 (drug_token_only_regression=False일 때 사용)
+    drug_token_loss_weight: float = 1.0
     loss_normalize_by_variance: bool = False
-    shift_loss_variance: float = 1.0
-    total_loss_variance: float = 1.0
+    dose_loss_variance: float = 1.0
+    dur_loss_variance: float = 1.0
     # Backward-compatibility option for legacy non-MDN checkpoints
-    total_log_transform: bool = False
+    dur_log_transform: bool = False
     
     # Loss weights
     loss_weight_data: float = 1.0
-    loss_weight_shift: float = 20.0
+    loss_weight_dose: float = 20.0
     # No separate auxiliary change head in legacy versions.
     loss_weight_change: float = 0.0
     loss_weight_total: float = 5.0
     loss_weight_time: float = 1.0
 
-    # Kept for compatibility (unused in legacy SHIFT regression)
-    # - shift_loss_type: 'dice_focal' | 'focal' | 'ce'
-    # - shift_class_weights: legacy class weights
-    shift_loss_type: str = 'dice_focal'
-    shift_dice_weight: float = 0.5
-    shift_ignore_index: int = -1
-    shift_maintain_idx: int = 2  # kept for compatibility (unused in legacy)
-    shift_change_weight_max: float = 10.0  # kept for compatibility (unused in legacy)
-    shift_focal_gamma: float = 2.0
-    shift_class_weights: list = field(default_factory=list)
+    # Kept for compatibility (unused in legacy DOSE regression)
+    # - dose_loss_type: 'dice_focal' | 'focal' | 'ce'
+    # - dose_class_weights: legacy class weights
+    dose_loss_type: str = 'dice_focal'
+    dose_dice_weight: float = 0.5
+    dose_ignore_index: int = -1
+    dose_maintain_idx: int = 2  # kept for compatibility (unused in legacy)
+    dose_change_weight_max: float = 10.0  # kept for compatibility (unused in legacy)
+    dose_focal_gamma: float = 2.0
+    dose_class_weights: list = field(default_factory=list)
     
     # Time-to-Event distribution: 'exponential' or 'weibull'
     # - exponential: 상수 hazard rate (memoryless)
@@ -935,7 +940,7 @@ class CompositeDelphi(nn.Module):
     """
     Composite Delphi: Composite Embedding + Multi-Head Output
     
-    입력: (DATA, SHIFT, TOTAL, AGE)
+    입력: (DATA, DOSE, DURATION, AGE)
     출력: 각 필드별 예측 + 시간 예측
     """
     
@@ -984,15 +989,15 @@ class CompositeDelphi(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
     
-    def forward(self, data, shift, total, age,
-                targets_data=None, targets_shift=None, targets_total=None,
+    def forward(self, data, dose, dur, age,
+                targets_data=None, targets_dose=None, targets_dur=None,
                 targets_age=None, drug_conditioning_data=None,
                 validation_loss_mode=False):
         """
         Args:
             data: (B, T) DATA tokens
-            shift: (B, T) SHIFT values
-            total: (B, T) TOTAL tokens
+            dose: (B, T) DOSE values
+            dur: (B, T) DURATION tokens
             age: (B, T) AGE values
             targets_*: 각 필드의 타겟 (optional)
         """
@@ -1000,7 +1005,7 @@ class CompositeDelphi(nn.Module):
         b, t = data.size()
         
         # 1. Composite Embedding
-        composite_emb = self.composite_emb(data, shift, total)
+        composite_emb = self.composite_emb(data, dose, dur)
         
         # 2. Age Encoding
         age_emb = self.age_encoding(age)
@@ -1040,10 +1045,10 @@ class CompositeDelphi(nn.Module):
         att = torch.stack(att_list) if (att_list and att_list[0] is not None) else None
         
         # 6. Multi-Head Output
-        # Drug-Conditioning: FiLM modulation for SHIFT/TOTAL prediction
+        # Drug-Conditioning: FiLM modulation for DOSE/DURATION prediction
         #
         # For teacher-forced training/evaluation, condition on target token ids so
-        # SHIFT/TOTAL heads learn p(value | next event token, history).
+        # DOSE/DURATION heads learn p(value | next event token, history).
         # For free-running inference (no targets), fall back to current input tokens.
         drug_emb = None
         drug_token_mask = None
@@ -1081,9 +1086,10 @@ class CompositeDelphi(nn.Module):
         if targets_data is not None:
             loss = self._compute_loss(
                 logits, data, age,
-                targets_data, targets_shift, targets_total, targets_age,
+                targets_data, targets_dose, targets_dur, targets_age,
                 attn_mask, validation_loss_mode,
-                moe_aux_loss=moe_aux_loss
+                moe_aux_loss=moe_aux_loss,
+                drug_token_mask=drug_token_mask
             )
         else:
             loss = None
@@ -1091,22 +1097,33 @@ class CompositeDelphi(nn.Module):
         return logits, loss, att
     
     def _compute_loss(self, logits, data, age,
-                      targets_data, targets_shift, targets_total, targets_age,
+                      targets_data, targets_dose, targets_dur, targets_age,
                       attn_mask, validation_loss_mode,
-                      moe_aux_loss=None):
+                      moe_aux_loss=None, drug_token_mask=None):
         """Compute multi-head losses"""
         device = data.device
         b, t = data.size()
-        
+
         ignored_tokens = self.config.ignore_tokens.copy()
         if validation_loss_mode:
             ignored_tokens += [1]
-        
+
         # Valid token mask
         targets_flat = targets_data.reshape(-1)
         pass_tokens = targets_flat != -1
         for k in ignored_tokens:
             pass_tokens = pass_tokens * (targets_flat != k)
+
+        # Drug token mask for regression heads (DOSE/DURATION)
+        drug_only_reg = bool(getattr(self.config, 'drug_token_only_regression', False))
+        drug_loss_weight = float(getattr(self.config, 'drug_token_loss_weight', 1.0))
+        if drug_token_mask is not None:
+            drug_mask_flat = drug_token_mask.reshape(-1)
+        else:
+            # Fallback: construct from config
+            drug_token_min = getattr(self.config, 'drug_token_min', 1278)
+            drug_token_max = getattr(self.config, 'drug_token_max', 1288)
+            drug_mask_flat = (targets_flat >= drug_token_min) & (targets_flat <= drug_token_max)
         
         # Clamp targets to valid vocab range (defensive measure)
         data_vocab_size = self.config.data_vocab_size
@@ -1123,211 +1140,218 @@ class CompositeDelphi(nn.Module):
             ignore_index=-1
         )
         
-        # 2. SHIFT regression loss (MDN NLL; same style as TOTAL head)
-        shift_mdn_source = logits.get('shift_mdn', None)
-        if 'shift_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
-            shift_mdn_source = logits['shift_mdn_drug_cond']
+        # 2. DOSE regression loss (MDN NLL; same style as DURATION head)
+        dose_mdn_source = logits.get('dose_mdn', None)
+        if 'dose_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
+            dose_mdn_source = logits['dose_mdn_drug_cond']
 
-        shift_targets_all = targets_shift.reshape(-1).float()
-        shift_pass_tokens = pass_tokens & (shift_targets_all != -1)
-        shift_continuous = bool(getattr(self.config, 'shift_continuous', False))
-        shift_log = bool(getattr(self.config, 'shift_log', False)) and shift_continuous
-        if shift_continuous and bool(getattr(self.config, 'separate_shift_na_from_padding', False)) and bool(getattr(self.config, 'shift_exclude_na_token', True)):
-            shift_na_token = int(getattr(self.config, 'shift_na_raw_token', 4))
+        dose_targets_all = targets_dose.reshape(-1).float()
+        dose_pass_tokens = pass_tokens & (dose_targets_all != -1)
+        dose_continuous = bool(getattr(self.config, 'dose_continuous', False))
+        dose_log = bool(getattr(self.config, 'dose_log', False)) and dose_continuous
+        if dose_continuous and bool(getattr(self.config, 'separate_dose_na_from_padding', False)) and bool(getattr(self.config, 'dose_exclude_na_token', True)):
+            dose_na_token = int(getattr(self.config, 'dose_na_raw_token', 4))
             if bool(getattr(self.config, 'apply_token_shift', False)):
-                shift_na_token += 1
-            shift_pass_tokens = shift_pass_tokens & (shift_targets_all != float(shift_na_token))
+                dose_na_token += 1
+            dose_pass_tokens = dose_pass_tokens & (dose_targets_all != float(dose_na_token))
 
-        if shift_continuous:
-            shift_valid_mask = shift_pass_tokens & (shift_targets_all >= 0)
+        if dose_continuous:
+            dose_valid_mask = dose_pass_tokens & (dose_targets_all >= 0)
         else:
-            shift_targets_discrete = shift_targets_all.long()
+            dose_targets_discrete = dose_targets_all.long()
             if getattr(self.config, 'apply_token_shift', False):
                 # shifted labels: 2=Dec, 3=Maint, 4=Inc
-                is_valid_shift = (shift_targets_discrete == 2) | (shift_targets_discrete == 3) | (shift_targets_discrete == 4)
+                is_valid_dose = (dose_targets_discrete == 2) | (dose_targets_discrete == 3) | (dose_targets_discrete == 4)
             else:
                 # raw labels: 1=Dec, 2=Maint, 3=Inc
-                is_valid_shift = (shift_targets_discrete == 1) | (shift_targets_discrete == 2) | (shift_targets_discrete == 3)
-            shift_valid_mask = shift_pass_tokens & is_valid_shift
+                is_valid_dose = (dose_targets_discrete == 1) | (dose_targets_discrete == 2) | (dose_targets_discrete == 3)
+            dose_valid_mask = dose_pass_tokens & is_valid_dose
 
-        shift_min = float(getattr(self.config, 'shift_min_value', -1.0))
-        shift_max = float(getattr(self.config, 'shift_max_value', -1.0))
-        if shift_max <= shift_min:
-            if shift_continuous:
-                shift_min = 0.0
-                shift_max = float(getattr(self.config, 'total_max_value', 550.0))
+        # Drug-token-only regression: DOSE loss를 약물 토큰에서만 계산
+        if drug_only_reg:
+            dose_valid_mask = dose_valid_mask & drug_mask_flat
+
+        dose_min = float(getattr(self.config, 'dose_min_value', -1.0))
+        dose_max = float(getattr(self.config, 'dose_max_value', -1.0))
+        if dose_max <= dose_min:
+            if dose_continuous:
+                dose_min = 0.0
+                dose_max = float(getattr(self.config, 'dur_max_value', 550.0))
             elif bool(getattr(self.config, 'apply_token_shift', False)):
-                shift_min, shift_max = 2.0, 4.0
+                dose_min, dose_max = 2.0, 4.0
             else:
-                shift_min, shift_max = 1.0, 3.0
-        shift_min_model, shift_max_model = _shift_bounds_for_model_space(
-            shift_min,
-            shift_max,
-            shift_log,
+                dose_min, dose_max = 1.0, 3.0
+        dose_min_model, dose_max_model = _dose_bounds_for_model_space(
+            dose_min,
+            dose_max,
+            dose_log,
         )
 
-        loss_shift = torch.tensor(0.0, device=device)
+        loss_dose = torch.tensor(0.0, device=device)
         loss_change = torch.tensor(0.0, device=device)
-        shift_scale = max(shift_max_model - shift_min_model, 1.0)
-        shift_label_scaling = str(getattr(self.config, 'shift_label_scaling', 'none')).lower()
-        shift_label_center = float(getattr(self.config, 'shift_label_center', 0.0))
-        shift_label_scale = float(getattr(self.config, 'shift_label_scale', 1.0))
-        shift_label_min = float(getattr(self.config, 'shift_label_min', shift_min_model))
-        shift_label_max = float(getattr(self.config, 'shift_label_max', shift_max_model))
-        if isinstance(shift_mdn_source, dict):
-            shift_pi_logits = shift_mdn_source['pi_logits'].reshape(-1, shift_mdn_source['pi_logits'].size(-1))[shift_valid_mask]
-            shift_mu = shift_mdn_source['mu'].reshape(-1, shift_mdn_source['mu'].size(-1))[shift_valid_mask]
-            shift_log_s = shift_mdn_source['log_s'].reshape(-1, shift_mdn_source['log_s'].size(-1))[shift_valid_mask]
-            shift_target = shift_targets_all[shift_valid_mask]
+        dose_scale = max(dose_max_model - dose_min_model, 1.0)
+        dose_label_scaling = str(getattr(self.config, 'dose_label_scaling', 'none')).lower()
+        dose_label_center = float(getattr(self.config, 'dose_label_center', 0.0))
+        dose_label_scale = float(getattr(self.config, 'dose_label_scale', 1.0))
+        dose_label_min = float(getattr(self.config, 'dose_label_min', dose_min_model))
+        dose_label_max = float(getattr(self.config, 'dose_label_max', dose_max_model))
+        if isinstance(dose_mdn_source, dict):
+            dose_pi_logits = dose_mdn_source['pi_logits'].reshape(-1, dose_mdn_source['pi_logits'].size(-1))[dose_valid_mask]
+            dose_mu = dose_mdn_source['mu'].reshape(-1, dose_mdn_source['mu'].size(-1))[dose_valid_mask]
+            dose_log_s = dose_mdn_source['log_s'].reshape(-1, dose_mdn_source['log_s'].size(-1))[dose_valid_mask]
+            dose_target = dose_targets_all[dose_valid_mask]
 
-            if shift_target.numel() > 0:
-                shift_target = _to_shift_model_space(shift_target, shift_log)
-                shift_target = shift_target.clamp(min=shift_min_model, max=shift_max_model)
-                shift_mean_src = shift_mdn_source.get('mean', None)
-                if shift_mean_src is not None:
-                    shift_pred_flat = shift_mean_src.reshape(-1)[shift_valid_mask]
+            if dose_target.numel() > 0:
+                dose_target = _to_dose_model_space(dose_target, dose_log)
+                dose_target = dose_target.clamp(min=dose_min_model, max=dose_max_model)
+                dose_mean_src = dose_mdn_source.get('mean', None)
+                if dose_mean_src is not None:
+                    dose_pred_flat = dose_mean_src.reshape(-1)[dose_valid_mask]
                 else:
-                    shift_pi = F.softmax(shift_pi_logits, dim=-1)
-                    shift_pred_flat = (shift_pi * shift_mu).sum(dim=-1)
-                shift_pred_flat = shift_pred_flat.clamp(min=shift_min_model, max=shift_max_model)
+                    dose_pi = F.softmax(dose_pi_logits, dim=-1)
+                    dose_pred_flat = (dose_pi * dose_mu).sum(dim=-1)
+                dose_pred_flat = dose_pred_flat.clamp(min=dose_min_model, max=dose_max_model)
 
-                shift_pred_scaled = _transform_targets(
-                    shift_pred_flat,
-                    shift_label_scaling,
-                    shift_label_center,
-                    shift_label_scale,
-                    shift_label_min,
-                    shift_label_max,
+                dose_pred_scaled = _transform_targets(
+                    dose_pred_flat,
+                    dose_label_scaling,
+                    dose_label_center,
+                    dose_label_scale,
+                    dose_label_min,
+                    dose_label_max,
                 )
-                shift_target_scaled = _transform_targets(
-                    shift_target,
-                    shift_label_scaling,
-                    shift_label_center,
-                    shift_label_scale,
-                    shift_label_min,
-                    shift_label_max,
+                dose_target_scaled = _transform_targets(
+                    dose_target,
+                    dose_label_scaling,
+                    dose_label_center,
+                    dose_label_scale,
+                    dose_label_min,
+                    dose_label_max,
                 )
 
                 # Primary objective for stable continuous regression.
                 loss_reg = F.smooth_l1_loss(
-                    shift_pred_scaled,
-                    shift_target_scaled,
-                    beta=max(0.25 * shift_scale, 0.1),
-                ) / shift_scale
+                    dose_pred_scaled,
+                    dose_target_scaled,
+                    beta=max(min(0.25 * dose_scale, 5.0), 0.1),
+                ) / max(dose_scale, 1.0)
 
                 # Optional MDN NLL auxiliary term (small weight), without hard plateau at 20.
-                y_shift = shift_target.unsqueeze(-1)
-                z_shift = (y_shift - shift_mu) / torch.exp(shift_log_s)
-                log_pdf_shift = -z_shift - shift_log_s - 2.0 * F.softplus(-z_shift)
-                log_pi_shift = F.log_softmax(shift_pi_logits, dim=-1)
-                log_prob_shift = torch.logsumexp(log_pi_shift + log_pdf_shift, dim=-1)
-                nll_shift = -log_prob_shift
-                nll_shift = torch.nan_to_num(nll_shift, nan=200.0, posinf=200.0, neginf=0.0)
-                loss_nll = torch.clamp(nll_shift, min=0.0, max=200.0).mean() / max(shift_scale, 1.0)
-                nll_w = float(getattr(self.config, 'shift_mdn_nll_weight', 0.05))
+                y_dose = dose_target.unsqueeze(-1)
+                z_dose = (y_dose - dose_mu) / torch.exp(dose_log_s)
+                log_pdf_dose = -z_dose - dose_log_s - 2.0 * F.softplus(-z_dose)
+                log_pi_dose = F.log_softmax(dose_pi_logits, dim=-1)
+                log_prob_dose = torch.logsumexp(log_pi_dose + log_pdf_dose, dim=-1)
+                nll_dose = -log_prob_dose
+                nll_dose = torch.nan_to_num(nll_dose, nan=200.0, posinf=200.0, neginf=0.0)
+                loss_nll = torch.clamp(nll_dose, min=0.0, max=200.0).mean() / max(dose_scale, 1.0)
+                nll_w = float(getattr(self.config, 'dose_mdn_nll_weight', 0.05))
                 nll_w = min(max(nll_w, 0.0), 1.0)
-                loss_shift = (1.0 - nll_w) * loss_reg + nll_w * loss_nll
+                loss_dose = (1.0 - nll_w) * loss_reg + nll_w * loss_nll
         else:
-            shift_pred_source = logits['shift']
-            if 'shift_drug_cond' in logits and self.config.use_drug_conditioning:
-                shift_pred_source = logits['shift_drug_cond']
-            shift_pred_flat = shift_pred_source.reshape(-1)[shift_valid_mask]
-            shift_target = shift_targets_all[shift_valid_mask]
-            if shift_target.numel() > 0:
-                shift_pred_flat = _to_shift_model_space(shift_pred_flat, shift_log)
-                shift_target = _to_shift_model_space(shift_target, shift_log)
-                shift_pred_flat = torch.clamp(shift_pred_flat, min=shift_min_model, max=shift_max_model)
-                shift_target = shift_target.clamp(min=shift_min_model, max=shift_max_model)
-                shift_pred_scaled = _transform_targets(
-                    shift_pred_flat,
-                    shift_label_scaling,
-                    shift_label_center,
-                    shift_label_scale,
-                    shift_label_min,
-                    shift_label_max,
+            dose_pred_source = logits['dose']
+            if 'dose_drug_cond' in logits and self.config.use_drug_conditioning:
+                dose_pred_source = logits['dose_drug_cond']
+            dose_pred_flat = dose_pred_source.reshape(-1)[dose_valid_mask]
+            dose_target = dose_targets_all[dose_valid_mask]
+            if dose_target.numel() > 0:
+                dose_pred_flat = _to_dose_model_space(dose_pred_flat, dose_log)
+                dose_target = _to_dose_model_space(dose_target, dose_log)
+                dose_pred_flat = torch.clamp(dose_pred_flat, min=dose_min_model, max=dose_max_model)
+                dose_target = dose_target.clamp(min=dose_min_model, max=dose_max_model)
+                dose_pred_scaled = _transform_targets(
+                    dose_pred_flat,
+                    dose_label_scaling,
+                    dose_label_center,
+                    dose_label_scale,
+                    dose_label_min,
+                    dose_label_max,
                 )
-                shift_target_scaled = _transform_targets(
-                    shift_target,
-                    shift_label_scaling,
-                    shift_label_center,
-                    shift_label_scale,
-                    shift_label_min,
-                    shift_label_max,
+                dose_target_scaled = _transform_targets(
+                    dose_target,
+                    dose_label_scaling,
+                    dose_label_center,
+                    dose_label_scale,
+                    dose_label_min,
+                    dose_label_max,
                 )
-                loss_shift = F.smooth_l1_loss(
-                    shift_pred_scaled,
-                    shift_target_scaled,
-                    beta=max(0.25 * shift_scale, 0.1),
-                ) / shift_scale
+                loss_dose = F.smooth_l1_loss(
+                    dose_pred_scaled,
+                    dose_target_scaled,
+                    beta=max(min(0.25 * dose_scale, 5.0), 0.1),
+                ) / max(dose_scale, 1.0)
 
-        # 3. TOTAL Loss (Mixture Density NLL preferred)
-        total_target = targets_total.float().reshape(-1)[pass_tokens]  # (N,)
-        total_mdn_source = logits.get('total_mdn', None)
-        if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
-            total_mdn_source = logits['total_mdn_drug_cond']
+        # 3. DURATION Loss (Mixture Density NLL preferred)
+        # Drug-token-only regression: DURATION loss를 약물 토큰에서만 계산
+        dur_pass_tokens = pass_tokens & drug_mask_flat if drug_only_reg else pass_tokens
+        dur_target = targets_dur.float().reshape(-1)[dur_pass_tokens]  # (N,)
+        dur_mdn_source = logits.get('dur_mdn', None)
+        if 'dur_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
+            dur_mdn_source = logits['dur_mdn_drug_cond']
 
-        total_label_scaling = str(getattr(self.config, 'total_label_scaling', 'none')).lower()
-        total_label_center = float(getattr(self.config, 'total_label_center', 0.0))
-        total_label_scale = float(getattr(self.config, 'total_label_scale', 1.0))
-        total_label_min = float(getattr(self.config, 'total_label_min', 0.0))
-        total_label_max = float(getattr(self.config, 'total_label_max', float(getattr(self.config, 'total_max_value', 550.0))))
-        if isinstance(total_mdn_source, dict):
-            pi_logits = total_mdn_source['pi_logits'].reshape(-1, total_mdn_source['pi_logits'].size(-1))[pass_tokens]
-            mu = total_mdn_source['mu'].reshape(-1, total_mdn_source['mu'].size(-1))[pass_tokens]
-            log_s = total_mdn_source['log_s'].reshape(-1, total_mdn_source['log_s'].size(-1))[pass_tokens]
+        dur_label_scaling = str(getattr(self.config, 'dur_label_scaling', 'none')).lower()
+        dur_label_center = float(getattr(self.config, 'dur_label_center', 0.0))
+        dur_label_scale = float(getattr(self.config, 'dur_label_scale', 1.0))
+        dur_label_min = float(getattr(self.config, 'dur_label_min', 0.0))
+        dur_label_max = float(getattr(self.config, 'dur_label_max', float(getattr(self.config, 'dur_max_value', 550.0))))
+        if isinstance(dur_mdn_source, dict):
+            pi_logits = dur_mdn_source['pi_logits'].reshape(-1, dur_mdn_source['pi_logits'].size(-1))[dur_pass_tokens]
+            mu = dur_mdn_source['mu'].reshape(-1, dur_mdn_source['mu'].size(-1))[dur_pass_tokens]
+            log_s = dur_mdn_source['log_s'].reshape(-1, dur_mdn_source['log_s'].size(-1))[dur_pass_tokens]
 
             # Mixture of logistics NLL:
             # log p(y) = logsumexp_k(log pi_k + log Logistic(y|mu_k, s_k))
-            total_target_scaled = _transform_targets(
-                total_target,
-                total_label_scaling,
-                total_label_center,
-                total_label_scale,
-                total_label_min,
-                total_label_max,
+            dur_target_scaled = _transform_targets(
+                dur_target,
+                dur_label_scaling,
+                dur_label_center,
+                dur_label_scale,
+                dur_label_min,
+                dur_label_max,
             )
 
-            if total_label_scaling in {'zscore', 'robust'}:
-                affine_scale = max(total_label_scale, 1e-8)
-                mu_scaled = (mu - total_label_center) / affine_scale
+            if dur_label_scaling in {'zscore', 'robust'}:
+                affine_scale = max(dur_label_scale, 1e-8)
+                mu_scaled = (mu - dur_label_center) / affine_scale
                 log_s_scaled = log_s - math.log(affine_scale)
-            elif total_label_scaling == 'minmax':
-                affine_scale = max(total_label_max - total_label_min, 1e-8)
-                mu_scaled = (mu - total_label_min) / affine_scale
+            elif dur_label_scaling == 'minmax':
+                affine_scale = max(dur_label_max - dur_label_min, 1e-8)
+                mu_scaled = (mu - dur_label_min) / affine_scale
                 log_s_scaled = log_s - math.log(affine_scale)
             else:
                 mu_scaled = mu
                 log_s_scaled = log_s
 
-            y = total_target_scaled.unsqueeze(-1)
+            y = dur_target_scaled.unsqueeze(-1)
             z = (y - mu_scaled) / torch.exp(log_s_scaled)
             log_pdf = -z - log_s_scaled - 2.0 * F.softplus(-z)
             log_pi = F.log_softmax(pi_logits, dim=-1)
             log_prob = torch.logsumexp(log_pi + log_pdf, dim=-1)
             nll = -log_prob
-            loss_total = torch.clamp(nll, min=0.0, max=20.0).mean()
+            nll = torch.nan_to_num(nll, nan=50.0, posinf=50.0, neginf=0.0)
+            loss_dur = torch.clamp(nll, min=0.0, max=50.0).mean()
         else:
             # Fallback for legacy checkpoints without MDN params
-            total_pred = logits['total'].reshape(-1)[pass_tokens]
-            total_scale = float(getattr(self.config, 'total_max_value', 550.0))
-            total_pred = torch.clamp(total_pred, min=0.0, max=total_scale)
-            total_pred_scaled = _transform_targets(
-                total_pred,
-                total_label_scaling,
-                total_label_center,
-                total_label_scale,
-                total_label_min,
-                total_label_max,
+            dur_pred = logits['duration'].reshape(-1)[dur_pass_tokens]
+            dur_scale = float(getattr(self.config, 'dur_max_value', 550.0))
+            dur_pred = torch.clamp(dur_pred, min=0.0, max=dur_scale)
+            dur_pred_scaled = _transform_targets(
+                dur_pred,
+                dur_label_scaling,
+                dur_label_center,
+                dur_label_scale,
+                dur_label_min,
+                dur_label_max,
             )
-            total_target_scaled = _transform_targets(
-                total_target,
-                total_label_scaling,
-                total_label_center,
-                total_label_scale,
-                total_label_min,
-                total_label_max,
+            dur_target_scaled = _transform_targets(
+                dur_target,
+                dur_label_scaling,
+                dur_label_center,
+                dur_label_scale,
+                dur_label_min,
+                dur_label_max,
             )
-            loss_total = F.mse_loss(total_pred_scaled, total_target_scaled) / (total_scale ** 2)
+            loss_dur = F.mse_loss(dur_pred_scaled, dur_target_scaled) / (dur_scale ** 2)
         
         # 4. Time-to-Event Loss
         # dt = time difference (days until next event)
@@ -1409,17 +1433,22 @@ class CompositeDelphi(nn.Module):
             loss_time = torch.mean(loss_time[pass_tokens])
         
         if bool(getattr(self.config, 'loss_normalize_by_variance', False)):
-            shift_var = max(float(getattr(self.config, 'shift_loss_variance', 1.0)), 1e-8)
-            total_var = max(float(getattr(self.config, 'total_loss_variance', 1.0)), 1e-8)
-            loss_shift = loss_shift / shift_var
-            loss_total = loss_total / total_var
+            dose_var = max(float(getattr(self.config, 'dose_loss_variance', 1.0)), 1e-8)
+            dur_var = max(float(getattr(self.config, 'dur_loss_variance', 1.0)), 1e-8)
+            loss_dose = loss_dose / dose_var
+            loss_dur = loss_dur / dur_var
+
+        # Drug-token loss upweighting (drug_only_reg=False일 때만 의미 있음)
+        if (not drug_only_reg) and drug_loss_weight > 1.0:
+            loss_dose = loss_dose * drug_loss_weight
+            loss_dur = loss_dur * drug_loss_weight
 
         # Weighted sum of losses
         total_loss = (
             self.config.loss_weight_data * loss_data +
-            self.config.loss_weight_shift * loss_shift +
+            self.config.loss_weight_dose * loss_dose +
             self.config.loss_weight_change * loss_change +
-            self.config.loss_weight_total * loss_total +
+            self.config.loss_weight_total * loss_dur +
             self.config.loss_weight_time * loss_time
         )
         
@@ -1432,9 +1461,9 @@ class CompositeDelphi(nn.Module):
         return {
             'loss': total_loss,
             'loss_data': loss_data,
-            'loss_shift': loss_shift,
+            'loss_dose': loss_dose,
             'loss_change': loss_change,
-            'loss_total': loss_total,
+            'loss_dur': loss_dur,
             'loss_time': loss_time,
             'loss_moe': loss_moe
         }
@@ -1520,7 +1549,7 @@ class CompositeDelphi(nn.Module):
         return optimizer
     
     @torch.no_grad()
-    def generate(self, data, shift, total, age, 
+    def generate(self, data, dose, dur, age, 
                  max_new_tokens=100, max_age=85*365.25,
                  no_repeat=True, termination_tokens=None):
         """Generate composite sequences"""
@@ -1533,33 +1562,33 @@ class CompositeDelphi(nn.Module):
         if max_new_tokens == -1:
             max_new_tokens = 128
         
-        shift_continuous = bool(getattr(self.config, 'shift_continuous', False))
-        shift_log = bool(getattr(self.config, 'shift_log', False)) and shift_continuous
-        if shift_continuous and not torch.is_floating_point(shift):
-            shift = shift.float()
+        dose_continuous = bool(getattr(self.config, 'dose_continuous', False))
+        dose_log = bool(getattr(self.config, 'dose_log', False)) and dose_continuous
+        if dose_continuous and not torch.is_floating_point(dose):
+            dose = dose.float()
 
         for _ in range(max_new_tokens):
-            logits, _, _ = self(data, shift, total, age, drug_conditioning_data=data)
+            logits, _, _ = self(data, dose, dur, age, drug_conditioning_data=data)
             
             # Get last position logits
             data_logits = logits['data'][:, -1, :]
-            shift_pred_base = logits['shift'][:, -1]
-            shift_pred_drug = shift_pred_base
-            if 'shift_drug_cond' in logits and self.config.use_drug_conditioning:
-                shift_pred_drug = logits['shift_drug_cond'][:, -1]
-            shift_mdn_base = logits.get('shift_mdn', None)
-            shift_mdn_drug = shift_mdn_base
-            if 'shift_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
-                shift_mdn_drug = logits['shift_mdn_drug_cond']
+            dose_pred_base = logits['dose'][:, -1]
+            dose_pred_drug = dose_pred_base
+            if 'dose_drug_cond' in logits and self.config.use_drug_conditioning:
+                dose_pred_drug = logits['dose_drug_cond'][:, -1]
+            dose_mdn_base = logits.get('dose_mdn', None)
+            dose_mdn_drug = dose_mdn_base
+            if 'dose_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
+                dose_mdn_drug = logits['dose_mdn_drug_cond']
 
-            total_pred_base = logits['total'][:, -1]
-            total_pred_drug = total_pred_base
-            if 'total_drug_cond' in logits and self.config.use_drug_conditioning:
-                total_pred_drug = logits['total_drug_cond'][:, -1]
-            total_mdn_base = logits.get('total_mdn', None)
-            total_mdn_drug = total_mdn_base
-            if 'total_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
-                total_mdn_drug = logits['total_mdn_drug_cond']
+            dur_pred_base = logits['duration'][:, -1]
+            dur_pred_drug = dur_pred_base
+            if 'dur_drug_cond' in logits and self.config.use_drug_conditioning:
+                dur_pred_drug = logits['dur_drug_cond'][:, -1]
+            dur_mdn_base = logits.get('dur_mdn', None)
+            dur_mdn_drug = dur_mdn_base
+            if 'dur_mdn_drug_cond' in logits and self.config.use_drug_conditioning:
+                dur_mdn_drug = logits['dur_mdn_drug_cond']
             # Mask ignored tokens
             data_logits[:, self.config.ignore_tokens] = -torch.inf
             
@@ -1599,115 +1628,115 @@ class CompositeDelphi(nn.Module):
             data_next = t_next[1][:, None]
             age_next = age[..., [-1]] + t_next[0][:, None]
 
-            # Use drug-conditioned SHIFT/TOTAL only when next DATA token is a drug.
-            shift_pred = shift_pred_base
-            shift_mdn_selected = shift_mdn_base
-            total_pred = total_pred_base
-            total_mdn_selected = total_mdn_base
+            # Use drug-conditioned DOSE/DURATION only when next DATA token is a drug.
+            dose_pred = dose_pred_base
+            dose_mdn_selected = dose_mdn_base
+            dur_pred = dur_pred_base
+            dur_mdn_selected = dur_mdn_base
             if self.config.use_drug_conditioning:
                 drug_token_min = getattr(self.config, 'drug_token_min', 1278)
                 drug_token_max = getattr(self.config, 'drug_token_max', 1288)
                 next_is_drug = (data_next >= drug_token_min) & (data_next <= drug_token_max)  # (B, 1)
-                shift_pred = torch.where(next_is_drug.squeeze(-1), shift_pred_drug, shift_pred_base)
-                if isinstance(shift_mdn_base, dict) and isinstance(shift_mdn_drug, dict):
+                dose_pred = torch.where(next_is_drug.squeeze(-1), dose_pred_drug, dose_pred_base)
+                if isinstance(dose_mdn_base, dict) and isinstance(dose_mdn_drug, dict):
                     mask_mdn = next_is_drug
-                    shift_mdn_selected = {
-                        'pi_logits': torch.where(mask_mdn, shift_mdn_drug['pi_logits'][:, -1, :], shift_mdn_base['pi_logits'][:, -1, :]),
-                        'mu': torch.where(mask_mdn, shift_mdn_drug['mu'][:, -1, :], shift_mdn_base['mu'][:, -1, :]),
-                        'log_s': torch.where(mask_mdn, shift_mdn_drug['log_s'][:, -1, :], shift_mdn_base['log_s'][:, -1, :]),
+                    dose_mdn_selected = {
+                        'pi_logits': torch.where(mask_mdn, dose_mdn_drug['pi_logits'][:, -1, :], dose_mdn_base['pi_logits'][:, -1, :]),
+                        'mu': torch.where(mask_mdn, dose_mdn_drug['mu'][:, -1, :], dose_mdn_base['mu'][:, -1, :]),
+                        'log_s': torch.where(mask_mdn, dose_mdn_drug['log_s'][:, -1, :], dose_mdn_base['log_s'][:, -1, :]),
                     }
-                total_pred = torch.where(next_is_drug.squeeze(-1), total_pred_drug, total_pred_base)
-                if isinstance(total_mdn_base, dict) and isinstance(total_mdn_drug, dict):
+                dur_pred = torch.where(next_is_drug.squeeze(-1), dur_pred_drug, dur_pred_base)
+                if isinstance(dur_mdn_base, dict) and isinstance(dur_mdn_drug, dict):
                     mask_mdn = next_is_drug
-                    total_mdn_selected = {
-                        'pi_logits': torch.where(mask_mdn, total_mdn_drug['pi_logits'][:, -1, :], total_mdn_base['pi_logits'][:, -1, :]),
-                        'mu': torch.where(mask_mdn, total_mdn_drug['mu'][:, -1, :], total_mdn_base['mu'][:, -1, :]),
-                        'log_s': torch.where(mask_mdn, total_mdn_drug['log_s'][:, -1, :], total_mdn_base['log_s'][:, -1, :]),
+                    dur_mdn_selected = {
+                        'pi_logits': torch.where(mask_mdn, dur_mdn_drug['pi_logits'][:, -1, :], dur_mdn_base['pi_logits'][:, -1, :]),
+                        'mu': torch.where(mask_mdn, dur_mdn_drug['mu'][:, -1, :], dur_mdn_base['mu'][:, -1, :]),
+                        'log_s': torch.where(mask_mdn, dur_mdn_drug['log_s'][:, -1, :], dur_mdn_base['log_s'][:, -1, :]),
                     }
-            elif isinstance(shift_mdn_base, dict):
-                shift_mdn_selected = {
-                    'pi_logits': shift_mdn_base['pi_logits'][:, -1, :],
-                    'mu': shift_mdn_base['mu'][:, -1, :],
-                    'log_s': shift_mdn_base['log_s'][:, -1, :],
+            elif isinstance(dose_mdn_base, dict):
+                dose_mdn_selected = {
+                    'pi_logits': dose_mdn_base['pi_logits'][:, -1, :],
+                    'mu': dose_mdn_base['mu'][:, -1, :],
+                    'log_s': dose_mdn_base['log_s'][:, -1, :],
                 }
-            elif isinstance(total_mdn_base, dict):
-                total_mdn_selected = {
-                    'pi_logits': total_mdn_base['pi_logits'][:, -1, :],
-                    'mu': total_mdn_base['mu'][:, -1, :],
-                    'log_s': total_mdn_base['log_s'][:, -1, :],
+            elif isinstance(dur_mdn_base, dict):
+                dur_mdn_selected = {
+                    'pi_logits': dur_mdn_base['pi_logits'][:, -1, :],
+                    'mu': dur_mdn_base['mu'][:, -1, :],
+                    'log_s': dur_mdn_base['log_s'][:, -1, :],
                 }
-            if isinstance(shift_mdn_selected, dict) and shift_mdn_selected['pi_logits'].dim() == 3:
-                shift_mdn_selected = {
-                    'pi_logits': shift_mdn_selected['pi_logits'][:, -1, :],
-                    'mu': shift_mdn_selected['mu'][:, -1, :],
-                    'log_s': shift_mdn_selected['log_s'][:, -1, :],
+            if isinstance(dose_mdn_selected, dict) and dose_mdn_selected['pi_logits'].dim() == 3:
+                dose_mdn_selected = {
+                    'pi_logits': dose_mdn_selected['pi_logits'][:, -1, :],
+                    'mu': dose_mdn_selected['mu'][:, -1, :],
+                    'log_s': dose_mdn_selected['log_s'][:, -1, :],
                 }
-            if isinstance(total_mdn_selected, dict) and total_mdn_selected['pi_logits'].dim() == 3:
-                total_mdn_selected = {
-                    'pi_logits': total_mdn_selected['pi_logits'][:, -1, :],
-                    'mu': total_mdn_selected['mu'][:, -1, :],
-                    'log_s': total_mdn_selected['log_s'][:, -1, :],
+            if isinstance(dur_mdn_selected, dict) and dur_mdn_selected['pi_logits'].dim() == 3:
+                dur_mdn_selected = {
+                    'pi_logits': dur_mdn_selected['pi_logits'][:, -1, :],
+                    'mu': dur_mdn_selected['mu'][:, -1, :],
+                    'log_s': dur_mdn_selected['log_s'][:, -1, :],
                 }
             
-            # Sample shift, total from their distributions
-            shift_sample_model = _to_shift_model_space(shift_pred, shift_log)
-            if isinstance(shift_mdn_selected, dict):
-                shift_pi_logits = shift_mdn_selected['pi_logits']  # (B, K)
-                shift_mu = shift_mdn_selected['mu']                # (B, K)
-                shift_log_s = shift_mdn_selected['log_s']          # (B, K)
-                shift_comp_idx = torch.distributions.Categorical(logits=shift_pi_logits).sample()
-                shift_gather_idx = shift_comp_idx.unsqueeze(-1)
-                shift_mu_sel = torch.gather(shift_mu, 1, shift_gather_idx).squeeze(-1)
-                shift_s_sel = torch.exp(torch.gather(shift_log_s, 1, shift_gather_idx).squeeze(-1))
-                shift_u = torch.rand_like(shift_mu_sel).clamp(min=1e-6, max=1.0 - 1e-6)
-                shift_sample_model = shift_mu_sel + shift_s_sel * (torch.log(shift_u) - torch.log1p(-shift_u))
-            shift_min = float(getattr(self.config, 'shift_min_value', 1.0))
-            shift_max = float(getattr(self.config, 'shift_max_value', 3.0))
-            if shift_min < 0.0 or shift_max < 0.0:
-                if shift_continuous:
-                    shift_min, shift_max = 0.0, float(getattr(self.config, 'total_max_value', 550.0))
+            # Sample dose, dur from their distributions
+            dose_sample_model = _to_dose_model_space(dose_pred, dose_log)
+            if isinstance(dose_mdn_selected, dict):
+                dose_pi_logits = dose_mdn_selected['pi_logits']  # (B, K)
+                dose_mu = dose_mdn_selected['mu']                # (B, K)
+                dose_log_s = dose_mdn_selected['log_s']          # (B, K)
+                dose_comp_idx = torch.distributions.Categorical(logits=dose_pi_logits).sample()
+                dose_gather_idx = dose_comp_idx.unsqueeze(-1)
+                dose_mu_sel = torch.gather(dose_mu, 1, dose_gather_idx).squeeze(-1)
+                dose_s_sel = torch.exp(torch.gather(dose_log_s, 1, dose_gather_idx).squeeze(-1))
+                dose_u = torch.rand_like(dose_mu_sel).clamp(min=1e-6, max=1.0 - 1e-6)
+                dose_sample_model = dose_mu_sel + dose_s_sel * (torch.log(dose_u) - torch.log1p(-dose_u))
+            dose_min = float(getattr(self.config, 'dose_min_value', 1.0))
+            dose_max = float(getattr(self.config, 'dose_max_value', 3.0))
+            if dose_min < 0.0 or dose_max < 0.0:
+                if dose_continuous:
+                    dose_min, dose_max = 0.0, float(getattr(self.config, 'dur_max_value', 550.0))
                 elif bool(getattr(self.config, 'apply_token_shift', False)):
-                    shift_min, shift_max = 2.0, 4.0
+                    dose_min, dose_max = 2.0, 4.0
                 else:
-                    shift_min, shift_max = 1.0, 3.0
-            shift_min_model, shift_max_model = _shift_bounds_for_model_space(
-                shift_min,
-                shift_max,
-                shift_log,
+                    dose_min, dose_max = 1.0, 3.0
+            dose_min_model, dose_max_model = _dose_bounds_for_model_space(
+                dose_min,
+                dose_max,
+                dose_log,
             )
-            if shift_continuous:
-                shift_sample_model = torch.clamp(shift_sample_model, min=shift_min_model, max=shift_max_model)
-                shift_next = _from_shift_model_space(shift_sample_model, shift_log)
-                shift_next = torch.clamp(shift_next, min=shift_min, max=shift_max).unsqueeze(-1)
+            if dose_continuous:
+                dose_sample_model = torch.clamp(dose_sample_model, min=dose_min_model, max=dose_max_model)
+                dose_next = _from_dose_model_space(dose_sample_model, dose_log)
+                dose_next = torch.clamp(dose_next, min=dose_min, max=dose_max).unsqueeze(-1)
             else:
-                shift_next = (
-                    torch.clamp(shift_sample_model.round(), min=shift_min, max=shift_max)
+                dose_next = (
+                    torch.clamp(dose_sample_model.round(), min=dose_min, max=dose_max)
                     .long()
                     .unsqueeze(-1)
                 )
             
-            # TOTAL generation:
+            # DURATION generation:
             # - Prefer MDN sampling (component sampling + logistic sampling)
             # - Fallback to legacy point estimate path for backward compatibility
-            total_raw = total_pred
-            if isinstance(total_mdn_selected, dict):
-                pi_logits = total_mdn_selected['pi_logits']  # (B, K)
-                mu = total_mdn_selected['mu']                # (B, K)
-                log_s = total_mdn_selected['log_s']          # (B, K)
+            dur_raw = dur_pred
+            if isinstance(dur_mdn_selected, dict):
+                pi_logits = dur_mdn_selected['pi_logits']  # (B, K)
+                mu = dur_mdn_selected['mu']                # (B, K)
+                log_s = dur_mdn_selected['log_s']          # (B, K)
                 comp_idx = torch.distributions.Categorical(logits=pi_logits).sample()  # (B,)
                 gather_idx = comp_idx.unsqueeze(-1)
                 mu_sel = torch.gather(mu, 1, gather_idx).squeeze(-1)
                 s_sel = torch.exp(torch.gather(log_s, 1, gather_idx).squeeze(-1))
                 u = torch.rand_like(mu_sel).clamp(min=1e-6, max=1.0 - 1e-6)
-                total_raw = mu_sel + s_sel * (torch.log(u) - torch.log1p(-u))
-            elif self.config.total_log_transform:
-                total_raw = torch.expm1(total_pred)  # legacy inverse of log1p
+                dur_raw = mu_sel + s_sel * (torch.log(u) - torch.log1p(-u))
+            elif self.config.dur_log_transform:
+                dur_raw = torch.expm1(dur_pred)  # legacy inverse of log1p
             
-            total_next = (
+            dur_next = (
                 torch.clamp(
-                    total_raw.round(),
+                    dur_raw.round(),
                     min=0,
-                    max=self.config.total_vocab_size - 1,
+                    max=self.config.dur_vocab_size - 1,
                 )
                 .long()
                 .unsqueeze(-1)
@@ -1715,8 +1744,8 @@ class CompositeDelphi(nn.Module):
             
             # Append to sequences
             data = torch.cat((data, data_next), dim=1)
-            shift = torch.cat((shift, shift_next), dim=1)
-            total = torch.cat((total, total_next), dim=1)
+            dose = torch.cat((dose, dose_next), dim=1)
+            dur = torch.cat((dur, dur_next), dim=1)
             age = torch.cat((age, age_next), dim=1)
             
             # Check termination
@@ -1726,4 +1755,4 @@ class CompositeDelphi(nn.Module):
             ).all():
                 break
         
-        return data, shift, total, age, logits
+        return data, dose, dur, age, logits

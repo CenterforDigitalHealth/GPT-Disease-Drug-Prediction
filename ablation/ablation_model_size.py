@@ -1,24 +1,48 @@
 #!/usr/bin/env python3
 """
-Run model-size ablation: small vs medium vs large.
+Ablation runner for model size: small vs medium vs large.
 
-For each model scale:
-1) Train from scratch with scale-specific architecture settings
-2) Evaluate using evaluate_auc.py
-3) Collect key metrics into a single summary JSON/CSV
+- Training:   train_model
+- Evaluation: evaluate_auc
+
+Screens model scales with different architecture settings.
+
+Per trial artifacts:
+  - train/eval logs
+  - checkpoint
+  - flattened metrics in trials.csv
+
+Global artifacts:
+  - trials.csv
+  - best_trial.json
+  - ablation_config.json
 """
-
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import os
 import shlex
-import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Dict, List
+
+from ablation._utils import (
+    get_repo_root,
+    run_subprocess,
+    write_csv,
+    load_existing_trials,
+    load_prefixed_metrics,
+    flatten_metrics,
+    resolve_checkpoint,
+    checkpoint_summary,
+    parse_gpu_ids,
+    build_env,
+    ensure_ddp_compatible,
+    as_float,
+    fmt_metric,
+    pick_best_trial,
+)
 
 
 MODEL_SCALES: Dict[str, Dict[str, object]] = {
@@ -31,7 +55,6 @@ MODEL_SCALES: Dict[str, Dict[str, object]] = {
         "batch_size": 128,
         "gradient_accumulation_steps": 1,
     },
-    # Current baseline in this repository
     "medium": {
         "n_layer": 12,
         "n_head": 12,
@@ -41,7 +64,6 @@ MODEL_SCALES: Dict[str, Dict[str, object]] = {
         "batch_size": 96,
         "gradient_accumulation_steps": 1,
     },
-    # Reduce per-device batch to lower OOM risk while scaling parameters
     "large": {
         "n_layer": 16,
         "n_head": 16,
@@ -52,69 +74,6 @@ MODEL_SCALES: Dict[str, Dict[str, object]] = {
         "gradient_accumulation_steps": 2,
     },
 }
-
-
-def _run(cmd: List[str], cwd: Path, env: Dict[str, str], log_path: Path) -> None:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("w", encoding="utf-8") as f:
-        f.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n\n")
-        f.flush()
-        proc = subprocess.run(
-            cmd,
-            cwd=str(cwd),
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    if proc.returncode != 0:
-        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}\nSee log: {log_path}")
-
-
-def _load_composite_metrics(eval_dir: Path) -> Dict[str, Dict]:
-    out: Dict[str, Dict] = {}
-    for fp in sorted(eval_dir.glob("*_composite_metrics.json")):
-        prefix = fp.name.replace("_composite_metrics.json", "")
-        with fp.open("r", encoding="utf-8") as f:
-            out[prefix] = json.load(f)
-    return out
-
-
-def _flatten_metrics(scale: str, metrics_by_prefix: Dict[str, Dict]) -> Dict[str, object]:
-    row: Dict[str, object] = {"model_scale": scale}
-    wanted = (
-        "auc_mean",
-        "auc_median",
-        "shift_accuracy",
-        "shift_f1_macro_drug_cond",
-        "total_mae_drug_cond",
-        "total_rmse_drug_cond",
-        "total_r2_drug_cond",
-    )
-    for prefix, m in metrics_by_prefix.items():
-        for k in wanted:
-            if k in m:
-                row[f"{prefix}.{k}"] = m[k]
-    return row
-
-
-def _write_csv(rows: List[Dict[str, object]], path: Path) -> None:
-    keys = sorted({k for r in rows for k in r.keys()})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=keys)
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(r)
-
-
-def _checkpoint_num_params(ckpt_path: Path) -> int:
-    import torch
-
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    state_dict = ckpt["model"]
-    return int(sum(v.numel() for v in state_dict.values()))
 
 
 def _parse_scales(scales_arg: str) -> List[str]:
@@ -129,146 +88,312 @@ def _parse_scales(scales_arg: str) -> List[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Ablation: model size (small/medium/large)")
-    parser.add_argument("--gpu_ids", type=str, default="0,1,2,3", help="CUDA_VISIBLE_DEVICES value")
+    parser.add_argument("--gpu_ids", type=str, default="0", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--input_path", type=str, default="../data", help="Data root for evaluation")
-    parser.add_argument(
-        "--output_root",
-        type=str,
-        default="ablation/model_size",
-        help="Root directory for ablation outputs",
-    )
-    parser.add_argument(
-        "--run_name",
-        type=str,
-        default="small_medium_large",
-        help="Subdirectory name under output_root",
-    )
-    parser.add_argument(
-        "--scales",
-        type=str,
-        default="small,medium,large",
-        help="Comma-separated model scales to run",
-    )
-    parser.add_argument("--max_iters", type=int, default=10000, help="Training max iterations")
-    parser.add_argument("--eval_interval", type=int, default=2000, help="Training eval interval")
+    parser.add_argument("--output_root", type=str, default="ablation/model_size", help="Root output dir")
+    parser.add_argument("--run_name", type=str, default="default", help="Run subdirectory name")
+    parser.add_argument("--scales", type=str, default="small,medium,large", help="Comma-separated model scales")
+    parser.add_argument("--max_iters", type=int, default=10000, help="Train max iterations per trial")
+    parser.add_argument("--eval_interval", type=int, default=2000, help="Train eval interval")
     parser.add_argument("--dataset_subset_size", type=int, default=10000, help="Eval subset size")
-    parser.add_argument("--eval_batch_size", type=int, default=64, help="Eval inference batch size")
+    parser.add_argument("--eval_batch_size", type=int, default=64, help="Eval batch size")
     parser.add_argument(
         "--data_files",
         type=str,
-        default="kr_val.bin,kr_test.bin,JMDC_extval.bin",
-        help="Comma-separated eval files for evaluate_auc.py",
+        default="dose/kr_val.bin,dose/kr_test.bin,dose/JMDC_extval.bin,UKB_extval.bin",
+        help="Comma-separated eval files for evaluate_auc",
     )
+    parser.add_argument("--extra_train_args", type=str, default="", help="Extra args forwarded to train_model.py")
+    parser.add_argument("--extra_eval_args", type=str, default="", help="Extra args forwarded to evaluate_auc.py")
     parser.add_argument(
-        "--extra_train_args",
-        type=str,
-        default="",
-        help="Extra args forwarded to train_model.py (e.g. \"--learning_rate=3e-4\")",
+        "--resume_from_trial_id",
+        type=int,
+        default=1,
+        help="Resume from this trial id (inclusive).",
     )
+    parser.add_argument("--skip_train", action="store_true", help="Skip training")
+    parser.add_argument("--skip_eval", action="store_true", help="Skip evaluation")
     parser.add_argument(
-        "--extra_eval_args",
-        type=str,
-        default="",
-        help="Extra args forwarded to evaluate_auc.py",
+        "--retry_eval_from_existing_ckpt",
+        action="store_true",
+        help="Retry eval from previously trained checkpoints without retraining.",
     )
-    parser.add_argument("--skip_train", action="store_true", help="Skip training and only run evaluation")
-    parser.add_argument("--skip_eval", action="store_true", help="Skip evaluation (training only)")
+    parser.add_argument("--wandb_log", action="store_true", help="Forward wandb_log to train_model")
+    parser.add_argument("--wandb_project", type=str, default="composite-delphi", help="Forwarded to train_model")
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default="ablation_model_size",
+        help="Base run name forwarded to train_model (trial suffix added)",
+    )
     args = parser.parse_args()
 
-    if args.max_iters <= 0:
-        raise ValueError("max_iters must be > 0")
-    if args.eval_interval <= 0:
-        raise ValueError("eval_interval must be > 0")
-
+    # ---- Validate ----
     scales = _parse_scales(args.scales)
-    repo_root = Path(__file__).resolve().parent
+    if args.resume_from_trial_id <= 0:
+        raise ValueError("resume_from_trial_id must be >= 1")
+
+    # ---- Paths ----
+    repo_root = get_repo_root()
     run_root = (repo_root / args.output_root / args.run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
 
-    ablation_cfg_path = run_root / "ablation_config.json"
-    with ablation_cfg_path.open("w", encoding="utf-8") as f:
+    with (run_root / "ablation_config.json").open("w", encoding="utf-8") as f:
         json.dump(vars(args), f, indent=2)
 
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
-
+    # ---- GPU / env ----
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    env = build_env(gpu_ids)
     extra_train = shlex.split(args.extra_train_args) if args.extra_train_args.strip() else []
     extra_eval = shlex.split(args.extra_eval_args) if args.extra_eval_args.strip() else []
+    ensure_ddp_compatible(extra_train, gpu_ids)
 
-    rows: List[Dict[str, object]] = []
+    print("=" * 72, flush=True)
+    print("Model size ablation started", flush=True)
+    print(f"Run root: {run_root}", flush=True)
+    print(f"Scales to screen: {scales}", flush=True)
+    print(
+        f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
+        f"(auto-DDP {'enabled' if len(gpu_ids) > 1 else 'single GPU'})",
+        flush=True,
+    )
+    print(f"Resume from trial id: {args.resume_from_trial_id}", flush=True)
+    print("=" * 72, flush=True)
 
-    for scale in scales:
+    # ---- Load existing trials for resume ----
+    trials_csv = run_root / "trials.csv"
+    existing_rows = load_existing_trials(trials_csv)
+    trial_rows_by_id: Dict[int, Dict[str, object]] = {
+        int(r.get("trial_id", 0)): dict(r) for r in existing_rows
+    }
+
+    # ---- Trial loop ----
+    total_trials = len(scales)
+
+    for trial_idx, scale in enumerate(scales, start=1):
+        trial_id = trial_idx
         spec = MODEL_SCALES[scale]
-        scale_root = run_root / scale
-        train_out = scale_root / "train_out"
-        eval_out = scale_root / "eval_out"
-        logs_dir = scale_root / "logs"
+        trial_name = f"t{trial_id:02d}_model_size-{scale}"
+        trial_root = run_root / trial_name
+        train_out = trial_root / "train_out"
+        eval_out = trial_root / "eval_out"
+        logs_dir = trial_root / "logs"
         train_log = logs_dir / "train.log"
         eval_log = logs_dir / "eval.log"
-        ckpt_path = train_out / "ckpt_composite.pt"
+        existing_ckpt = resolve_checkpoint(train_out)
+        existing_row = trial_rows_by_id.get(trial_id)
+        retry_eval_this_trial = (
+            args.retry_eval_from_existing_ckpt
+            and existing_ckpt is not None
+            and trial_id >= args.resume_from_trial_id
+        )
 
-        if not args.skip_train:
-            train_cmd = [
-                sys.executable,
-                "-m",
-                "train_model",
-                "--init_from=scratch",
-                f"--out_dir={train_out}",
-                f"--max_iters={args.max_iters}",
-                f"--eval_interval={args.eval_interval}",
-                f"--n_layer={spec['n_layer']}",
-                f"--n_head={spec['n_head']}",
-                f"--n_kv_head={spec['n_kv_head']}",
-                f"--n_embd={spec['n_embd']}",
-                f"--dropout={spec['dropout']}",
-                f"--batch_size={spec['batch_size']}",
-                f"--gradient_accumulation_steps={spec['gradient_accumulation_steps']}",
-            ] + extra_train
-            _run(train_cmd, cwd=repo_root, env=env, log_path=train_log)
+        if trial_id < args.resume_from_trial_id and not retry_eval_this_trial:
+            continue
 
-        if not ckpt_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        if (
+            args.retry_eval_from_existing_ckpt
+            and args.skip_train
+            and trial_id >= args.resume_from_trial_id
+            and existing_ckpt is None
+        ):
+            print(
+                f"\n[trial {trial_idx}/{total_trials}] SKIP "
+                f"(id={trial_id:02d}) no existing checkpoint "
+                "(retry mode + --skip_train).",
+                flush=True,
+            )
+            continue
 
-        metrics_by_prefix: Dict[str, Dict] = {}
-        if not args.skip_eval:
-            eval_cmd = [
-                sys.executable,
-                "-m",
-                "evaluate_auc",
-                f"--input_path={args.input_path}",
-                f"--model_ckpt_path={ckpt_path}",
-                f"--output_path={eval_out}",
-                "--model_type=composite",
-                f"--dataset_subset_size={args.dataset_subset_size}",
-                f"--eval_batch_size={args.eval_batch_size}",
-                f"--data_files={args.data_files}",
-            ] + extra_eval
-            _run(eval_cmd, cwd=repo_root, env=env, log_path=eval_log)
-            metrics_by_prefix = _load_composite_metrics(eval_out)
+        start_tag = "RETRY-EVAL" if retry_eval_this_trial else "START"
+        print(
+            f"\n[trial {trial_idx}/{total_trials}] {start_tag} "
+            f"(id={trial_id:02d}) model_scale={scale}",
+            flush=True,
+        )
 
-        row = _flatten_metrics(scale, metrics_by_prefix)
-        row["n_layer"] = spec["n_layer"]
-        row["n_head"] = spec["n_head"]
-        row["n_kv_head"] = spec["n_kv_head"]
-        row["n_embd"] = spec["n_embd"]
-        row["batch_size"] = spec["batch_size"]
-        row["grad_accumulation"] = spec["gradient_accumulation_steps"]
-        row["num_params"] = _checkpoint_num_params(ckpt_path)
-        row["checkpoint_path"] = str(ckpt_path)
-        row["train_log"] = str(train_log)
-        row["eval_log"] = str(eval_log)
-        rows.append(row)
+        row: Dict[str, object] = dict(existing_row) if existing_row is not None else {}
+        for k in list(row.keys()):
+            if "." in k:
+                row.pop(k, None)
 
-    summary_json = run_root / "summary.json"
-    summary_csv = run_root / "summary.csv"
-    with summary_json.open("w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
-    _write_csv(rows, summary_csv)
+        row.update({
+            "trial_id": trial_id,
+            "trial_name": trial_name,
+            "status": "running",
+            "error_message": "",
+            "is_best": False,
+            "model_scale": scale,
+            "n_layer": spec["n_layer"],
+            "n_head": spec["n_head"],
+            "n_kv_head": spec["n_kv_head"],
+            "n_embd": spec["n_embd"],
+            "visible_gpu_count": len(gpu_ids),
+            "visible_gpu_ids": env["CUDA_VISIBLE_DEVICES"],
+            "checkpoint_path": "",
+            "train_log": str(train_log),
+            "eval_log": str(eval_log),
+        })
 
-    print("\nAblation completed.")
+        t_total0 = time.time()
+        train_seconds = 0.0
+        eval_seconds = 0.0
+
+        try:
+            # ---- Train ----
+            if retry_eval_this_trial:
+                print(
+                    f"[trial {trial_idx}/{total_trials}] Reusing existing checkpoint "
+                    f"for eval retry: {existing_ckpt}",
+                    flush=True,
+                )
+            elif not args.skip_train:
+                print(
+                    f"[trial {trial_idx}/{total_trials}] Training... (log: {train_log})",
+                    flush=True,
+                )
+                train_cmd = [
+                    sys.executable,
+                    "-m",
+                    "train_model",
+                    "--init_from=scratch",
+                    "--out_dir_use_timestamp=False",
+                    f"--out_dir={train_out}",
+                    f"--max_iters={args.max_iters}",
+                    f"--eval_interval={args.eval_interval}",
+                    f"--n_layer={spec['n_layer']}",
+                    f"--n_head={spec['n_head']}",
+                    f"--n_kv_head={spec['n_kv_head']}",
+                    f"--n_embd={spec['n_embd']}",
+                    f"--dropout={spec['dropout']}",
+                    f"--batch_size={spec['batch_size']}",
+                    f"--gradient_accumulation_steps={spec['gradient_accumulation_steps']}",
+                ] + extra_train
+                if args.wandb_log:
+                    train_cmd += [
+                        "--wandb_log=True",
+                        f"--wandb_project={args.wandb_project}",
+                        f"--wandb_run_name={args.wandb_run_name}_{trial_name}",
+                    ]
+                train_seconds = run_subprocess(train_cmd, repo_root, env, train_log)
+                print(
+                    f"[trial {trial_idx}/{total_trials}] Training done in {train_seconds:.1f}s",
+                    flush=True,
+                )
+
+            # ---- Resolve checkpoint ----
+            resolved_ckpt = existing_ckpt if retry_eval_this_trial else resolve_checkpoint(train_out)
+            if resolved_ckpt is None:
+                raise FileNotFoundError(
+                    f"Checkpoint not found under {train_out} "
+                    "(checked: ckpt.pt, ckpt_composite.pt, ckpt_*.pt)"
+                )
+            row["checkpoint_path"] = str(resolved_ckpt)
+
+            ckpt_info = checkpoint_summary(resolved_ckpt)
+            row.update(ckpt_info)
+            print(
+                f"[trial {trial_idx}/{total_trials}] Checkpoint loaded: "
+                f"iter={row.get('checkpoint_iter')}, "
+                f"best_val_loss={fmt_metric(row.get('best_val_loss'))}, "
+                f"num_params_m={fmt_metric(row.get('num_params_m'), 2)}",
+                flush=True,
+            )
+
+            # ---- Evaluate ----
+            metrics_by_prefix: Dict[str, Dict] = {}
+            if not args.skip_eval:
+                print(
+                    f"[trial {trial_idx}/{total_trials}] Evaluating... (log: {eval_log})",
+                    flush=True,
+                )
+                eval_cmd = [
+                    sys.executable,
+                    "-m",
+                    "evaluate_auc",
+                    f"--input_path={args.input_path}",
+                    f"--model_ckpt_path={resolved_ckpt}",
+                    f"--output_path={eval_out}",
+                    f"--dataset_subset_size={args.dataset_subset_size}",
+                    f"--eval_batch_size={args.eval_batch_size}",
+                    f"--data_files={args.data_files}",
+                ] + extra_eval
+                eval_seconds = run_subprocess(eval_cmd, repo_root, env, eval_log)
+                metrics_by_prefix = load_prefixed_metrics(eval_out)
+                print(
+                    f"[trial {trial_idx}/{total_trials}] Evaluation done in {eval_seconds:.1f}s",
+                    flush=True,
+                )
+
+            row.update(flatten_metrics(metrics_by_prefix))
+            row["status"] = "success"
+            print(
+                f"[trial {trial_idx}/{total_trials}] RESULT "
+                f"val.auc_mean={fmt_metric(row.get('val.auc_mean'))}, "
+                f"val.dose_rmse={fmt_metric(row.get('val.dose_rmse'))}, "
+                f"val.dur_rmse={fmt_metric(row.get('val.dur_rmse'))}, "
+                f"best_val_loss={fmt_metric(row.get('best_val_loss'))}",
+                flush=True,
+            )
+        except Exception as e:
+            row["status"] = "failed"
+            row["error_message"] = str(e)
+            print(
+                f"[trial {trial_idx}/{total_trials}] FAILED: {e}\n"
+                f"  train_log={train_log}\n"
+                f"  eval_log={eval_log}",
+                flush=True,
+            )
+        finally:
+            row["train_seconds"] = float(train_seconds)
+            row["eval_seconds"] = float(eval_seconds)
+            row["total_seconds"] = float(time.time() - t_total0)
+            trial_rows_by_id[trial_id] = row
+            all_rows = [trial_rows_by_id[tid] for tid in sorted(trial_rows_by_id)]
+            write_csv(all_rows, trials_csv)
+            ok = sum(1 for r in all_rows if str(r.get("status", "")) == "success")
+            fail = len(all_rows) - ok
+            print(
+                f"[trial {trial_idx}/{total_trials}] DONE status={row['status']} "
+                f"(success={ok}, failed={fail})",
+                flush=True,
+            )
+
+    # ---- Pick best trial ----
+    trial_rows = [trial_rows_by_id[tid] for tid in sorted(trial_rows_by_id)]
+
+    best_idx = pick_best_trial(trial_rows)
+    best_row = None
+    if best_idx >= 0:
+        trial_rows[best_idx]["is_best"] = True
+        best_row = trial_rows[best_idx]
+
+    write_csv(trial_rows, trials_csv)
+
+    with (run_root / "best_trial.json").open("w", encoding="utf-8") as f:
+        json.dump(best_row if best_row is not None else {}, f, indent=2)
+
+    # ---- Summary ----
+    success_count = sum(1 for r in trial_rows if str(r.get("status", "")) == "success")
+    failed_count = len(trial_rows) - success_count
+    print("\n" + "=" * 72, flush=True)
+    print("Model size ablation completed.", flush=True)
+    print(f"Trials summary: success={success_count}, failed={failed_count}", flush=True)
+    if best_row is not None:
+        print(
+            f"Best trial id={best_row.get('trial_id')} "
+            f"(val.auc_mean={fmt_metric(best_row.get('val.auc_mean'))}, "
+            f"val.dose_rmse={fmt_metric(best_row.get('val.dose_rmse'))}, "
+            f"val.dur_rmse={fmt_metric(best_row.get('val.dur_rmse'))}, "
+            f"best_val_loss={fmt_metric(best_row.get('best_val_loss'))})",
+            flush=True,
+        )
+    else:
+        print("Best trial: none (no successful trials)", flush=True)
     print(f"Run root: {run_root}")
-    print(f"Summary JSON: {summary_json}")
-    print(f"Summary CSV: {summary_csv}")
+    print(f"Trials CSV: {trials_csv}")
+    print(f"Best trial JSON: {run_root / 'best_trial.json'}")
+    print("=" * 72, flush=True)
 
 
 if __name__ == "__main__":

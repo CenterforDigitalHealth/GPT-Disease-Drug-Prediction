@@ -44,7 +44,7 @@ def get_common_diseases(labels_df, filter_min_total=100):
         filter_min_total: Minimum count to include a token
     
     Returns:
-        List of shifted token IDs (labels.csv index + 1, due to +1 shift in get_batch_composite)
+        List of shifted token IDs (labels.csv index + 1, due to +1 dose in get_batch_composite)
     """
     if 'count' in labels_df.columns:
         labels_df_filtered = labels_df[labels_df['count'] > filter_min_total]
@@ -54,38 +54,38 @@ def get_common_diseases(labels_df, filter_min_total=100):
         labels_df_filtered = labels_df[labels_df['index'] > 20]
     
     # labels.csv 'index' = raw data value
-    # get_batch_composite applies +1 shift to all DATA tokens
+    # get_batch_composite applies +1 dose to all DATA tokens
     # Therefore, shifted token ID = raw data value + 1
     raw_indices = labels_df_filtered['index'].tolist()
     shifted_tokens = [idx + 1 for idx in raw_indices]
     return shifted_tokens
 
 
-def get_shift_label_indices(apply_token_shift: bool):
-    """Return SHIFT label ids for (decrease, maintain, increase)."""
+def get_dose_label_indices(apply_token_shift: bool):
+    """Return DOSE label ids for (decrease, maintain, increase)."""
     if apply_token_shift:
         return 2, 3, 4
     return 1, 2, 3
 
 
-def hierarchical_logits_to_shift_labels(
+def hierarchical_logits_to_dose_labels(
     change_logits: torch.Tensor,
     direction_logits: torch.Tensor,
     apply_token_shift: bool,
 ) -> torch.Tensor:
     """
-    Convert hierarchical SHIFT predictions to 3-class labels.
+    Convert hierarchical DOSE predictions to 3-class labels.
     - stage1: maintain(0) vs changed(1)
     - stage2: decrease(0) vs increase(1) for changed
     """
-    dec_idx, maintain_idx, inc_idx = get_shift_label_indices(apply_token_shift)
+    dec_idx, maintain_idx, inc_idx = get_dose_label_indices(apply_token_shift)
     change_pred = torch.argmax(change_logits, dim=-1)
     direction_pred = torch.argmax(direction_logits, dim=-1)
-    shift_pred = torch.full_like(change_pred, fill_value=maintain_idx)
+    dose_pred = torch.full_like(change_pred, fill_value=maintain_idx)
     changed_mask = change_pred == 1
-    shift_pred[changed_mask & (direction_pred == 0)] = dec_idx
-    shift_pred[changed_mask & (direction_pred == 1)] = inc_idx
-    return shift_pred
+    dose_pred[changed_mask & (direction_pred == 0)] = dec_idx
+    dose_pred[changed_mask & (direction_pred == 1)] = inc_idx
+    return dose_pred
 
 
 def fit_affine_calibration(pred: np.ndarray, target: np.ndarray):
@@ -137,7 +137,7 @@ def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
 
     n_case = case.size(0)
     n_control = control.size(0)
-    total = n_case + n_control
+    dur = n_case + n_control
 
     # Generate bootstrap samples
     boot_idx_case = torch.randint(0, n_case, (n_bootstrap, n_case), device="cuda")
@@ -149,7 +149,7 @@ def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
     combined = torch.cat([boot_case, boot_control], dim=1)
 
     # Mask to identify case entries
-    mask = torch.zeros((n_bootstrap, total), dtype=torch.bool, device="cuda")
+    mask = torch.zeros((n_bootstrap, dur), dtype=torch.bool, device="cuda")
     mask[:, :n_case] = True
 
     # Compute ranks and AUC
@@ -433,7 +433,7 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
 
 def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc_calibration='none'):
     """
-    Evaluate SHIFT, TOTAL predictions for CompositeDelphi v6 model.
+    Evaluate DOSE, DURATION predictions for CompositeDelphi v6 model.
     
     Args:
         model: CompositeDelphi model
@@ -446,45 +446,44 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
     """
     model.eval()
     model.to(device)
-    all_predictions = {'shift': [], 'total': []}
-    all_targets = {'shift': [], 'total': []}
-    # For TOTAL regression, also compute "positive-only" metrics (targets > 0), since zeros dominate.
-    all_predictions_pos = {'total': []}
-    all_targets_pos = {'total': []}
 
-    # Drug-conditioned predictions (if model uses drug-conditioning)
-    all_predictions_shift_drug_cond = []
-    all_predictions_total_drug_cond = []
-    all_targets_shift_drug_cond = []
-    all_targets_total_drug_cond = []
+    # Drug-token predictions only (primary metrics)
+    all_predictions_dose = []
+    all_predictions_dur = []
+    all_targets_dose = []
+    all_targets_dur = []
+
+    # MDN NLL accumulators (drug-token only)
+    mdn_nll_dose_sum, mdn_nll_dose_count = 0.0, 0
+    mdn_nll_dur_sum, mdn_nll_dur_count = 0.0, 0
     use_drug_conditioning = getattr(model.config, 'use_drug_conditioning', False)
     eval_apply_token_shift = bool(getattr(model.config, 'apply_token_shift', False))
-    eval_shift_continuous = bool(getattr(model.config, 'shift_continuous', False))
-    eval_shift_exclude_na_token = bool(getattr(model.config, 'shift_exclude_na_token', True))
-    eval_separate_shift_na = bool(getattr(model.config, 'separate_shift_na_from_padding', False))
-    # Continuous SHIFT regression should not treat value 0 as a special NA token.
-    if eval_shift_continuous and eval_separate_shift_na:
-        eval_separate_shift_na = False
-    eval_shift_na_token = int(getattr(model.config, 'shift_na_raw_token', 4))
+    eval_dose_continuous = bool(getattr(model.config, 'dose_continuous', False))
+    eval_dose_exclude_na_token = bool(getattr(model.config, 'dose_exclude_na_token', True))
+    eval_separate_dose_na = bool(getattr(model.config, 'separate_dose_na_from_padding', False))
+    # Continuous DOSE regression should not treat value 0 as a special NA token.
+    if eval_dose_continuous and eval_separate_dose_na:
+        eval_separate_dose_na = False
+    eval_dose_na_token = int(getattr(model.config, 'dose_na_raw_token', 4))
     if eval_apply_token_shift:
-        eval_shift_na_token += 1
-    shift_min_eval = float(getattr(model.config, 'shift_min_value', -1.0))
-    shift_max_eval = float(getattr(model.config, 'shift_max_value', -1.0))
-    if shift_max_eval <= shift_min_eval:
-        if eval_shift_continuous:
-            shift_min_eval = 0.0
-            shift_max_eval = float(getattr(model.config, 'total_max_value', 550.0))
+        eval_dose_na_token += 1
+    dose_min_eval = float(getattr(model.config, 'dose_min_value', -1.0))
+    dose_max_eval = float(getattr(model.config, 'dose_max_value', -1.0))
+    if dose_max_eval <= dose_min_eval:
+        if eval_dose_continuous:
+            dose_min_eval = 0.0
+            dose_max_eval = float(getattr(model.config, 'dur_max_value', 550.0))
         elif eval_apply_token_shift:
-            shift_min_eval, shift_max_eval = 2.0, 4.0
+            dose_min_eval, dose_max_eval = 2.0, 4.0
         else:
-            shift_min_eval, shift_max_eval = 1.0, 3.0
-    dec_idx, maintain_idx, inc_idx = get_shift_label_indices(eval_apply_token_shift)
+            dose_min_eval, dose_max_eval = 1.0, 3.0
+    dec_idx, maintain_idx, inc_idx = get_dose_label_indices(eval_apply_token_shift)
     drug_token_min = int(getattr(model.config, 'drug_token_min', 1278))
     drug_token_max = int(getattr(model.config, 'drug_token_max', 1288))
     drug_token_note = f"Metrics computed only for drug tokens ({drug_token_min}-{drug_token_max})"
     
-    x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
-    y_data, y_shift, y_total, y_ages = d100k[4], d100k[5], d100k[6], d100k[7]
+    x_data, x_dose, x_dur, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
+    y_data, y_dose, y_dur, y_ages = d100k[4], d100k[5], d100k[6], d100k[7]
     
     num_batches = (x_data.shape[0] + batch_size - 1) // batch_size
     
@@ -494,290 +493,226 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
             end_idx = min(start_idx + batch_size, x_data.shape[0])
             
             batch_x_data = x_data[start_idx:end_idx].to(device)
-            batch_x_shift = x_shift[start_idx:end_idx].to(device)
-            batch_x_total = x_total[start_idx:end_idx].to(device)
+            batch_x_dose = x_dose[start_idx:end_idx].to(device)
+            batch_x_dur = x_dur[start_idx:end_idx].to(device)
             batch_x_ages = x_ages[start_idx:end_idx].to(device)
             
             # Get targets on device
             batch_y_data = y_data[start_idx:end_idx].to(device)
-            batch_y_shift = y_shift[start_idx:end_idx].to(device)
-            batch_y_total = y_total[start_idx:end_idx].to(device)
+            batch_y_dose = y_dose[start_idx:end_idx].to(device)
+            batch_y_dur = y_dur[start_idx:end_idx].to(device)
             
-            # Pass targets for drug-conditioning evaluation (uses GT drug embedding)
+            # Pass targets for drugitioning evaluation (uses GT drug embedding)
             outputs = model(
-                batch_x_data, batch_x_shift, batch_x_total, batch_x_ages,
-                targets_data=batch_y_data, targets_shift=batch_y_shift, 
-                targets_total=batch_y_total,
+                batch_x_data, batch_x_dose, batch_x_dur, batch_x_ages,
+                targets_data=batch_y_data, targets_dose=batch_y_dose, 
+                targets_dur=batch_y_dur,
                 targets_age=y_ages[start_idx:end_idx].to(device)
             )[0]  # Get logits dict
             
             # v6:
-            # - SHIFT: regression output (B, T)
-            # - TOTAL: regression output (B, T)
-            shift_pred = outputs['shift']
-            total_pred = outputs['total']
+            # - DOSE: regression output (B, T)
+            # - DURATION: regression output (B, T)
+            dose_pred = outputs['dose']
+            dur_pred = outputs['duration']
 
-            # SHIFT log handling:
-            # - New checkpoints (shift_log=True): model already outputs raw-space SHIFT.
-            # - Legacy checkpoints (shift_log_transform=True, non-MDN): outputs may be log-space.
-            shift_log = bool(getattr(model.config, 'shift_log', False))
-            shift_log_transform_legacy = bool(getattr(model.config, 'shift_log_transform', False))
-            has_mdn_shift = isinstance(outputs.get('shift_mdn', None), dict)
-            if shift_log_transform_legacy and (not shift_log) and (not has_mdn_shift):
-                shift_pred = torch.expm1(shift_pred)
+            # DOSE log handling:
+            # - New checkpoints (dose_log=True): model already outputs raw-space DOSE.
+            # - Legacy checkpoints (dose_log_transform=True, non-MDN): outputs may be log-space.
+            dose_log = bool(getattr(model.config, 'dose_log', False))
+            dose_log_transform_legacy = bool(getattr(model.config, 'dose_log_transform', False))
+            has_mdn_dose = isinstance(outputs.get('dose_mdn', None), dict)
+            if dose_log_transform_legacy and (not dose_log) and (not has_mdn_dose):
+                dose_pred = torch.expm1(dose_pred)
 
-            # Inverse log-transform if model was trained with total_log_transform
-            total_log_transform = getattr(model.config, 'total_log_transform', False)
-            has_mdn_total = isinstance(outputs.get('total_mdn', None), dict)
-            if total_log_transform and not has_mdn_total:
-                total_pred = torch.expm1(total_pred)  # inverse of log1p
+            # Inverse log-transform if model was trained with dur_log_transform
+            dur_log_transform = getattr(model.config, 'dur_log_transform', False)
+            has_mdn_total = isinstance(outputs.get('dur_mdn', None), dict)
+            if dur_log_transform and not has_mdn_total:
+                dur_pred = torch.expm1(dur_pred)  # inverse of log1p
 
             # Defensive compatibility handling for unexpected checkpoint outputs.
-            if shift_pred.dim() == 3:
-                if shift_pred.size(-1) == 1:
-                    shift_pred = shift_pred.squeeze(-1)
+            if dose_pred.dim() == 3:
+                if dose_pred.size(-1) == 1:
+                    dose_pred = dose_pred.squeeze(-1)
                 else:
-                    shift_pred = torch.argmax(shift_pred, dim=-1).float()
+                    dose_pred = torch.argmax(dose_pred, dim=-1).float()
             
             # Use per-field valid masks
             valid_data_mask = (batch_y_data != -1) & (batch_y_data > 0)
-            if eval_shift_continuous:
-                shift_mask = valid_data_mask & (batch_y_shift != -1) & (batch_y_shift >= 0)
-                if eval_separate_shift_na and eval_shift_exclude_na_token:
-                    shift_mask = shift_mask & (batch_y_shift != eval_shift_na_token)
+            if eval_dose_continuous:
+                dose_mask = valid_data_mask & (batch_y_dose != -1) & (batch_y_dose >= 0)
+                if eval_separate_dose_na and eval_dose_exclude_na_token:
+                    dose_mask = dose_mask & (batch_y_dose != eval_dose_na_token)
             else:
-                shift_mask = (
-                    (batch_y_shift == dec_idx)
-                    | (batch_y_shift == maintain_idx)
-                    | (batch_y_shift == inc_idx)
+                dose_mask = (
+                    (batch_y_dose == dec_idx)
+                    | (batch_y_dose == maintain_idx)
+                    | (batch_y_dose == inc_idx)
                 )
-                shift_mask = shift_mask & valid_data_mask
-            total_mask = (batch_y_total != -1) & (batch_y_total >= 0)
+                dose_mask = dose_mask & valid_data_mask
+            dur_mask = (batch_y_dur != -1) & (batch_y_dur >= 0)
             
-            # Drug token mask: only evaluate drug-conditioned predictions for configured drug range
+            # Drug token mask: only evaluate drugitioned predictions for configured drug range
             drug_token_mask = (batch_y_data >= drug_token_min) & (batch_y_data <= drug_token_max)
 
-            # SHIFT (regression)
-            if shift_mask.any():
-                all_predictions['shift'].append(shift_pred[shift_mask].float().cpu().numpy())
-                all_targets['shift'].append(batch_y_shift[shift_mask].float().cpu().numpy())
-                
-                # Drug-conditioned SHIFT (regression)
-                if use_drug_conditioning and 'shift_drug_cond' in outputs:
-                    shift_drug_pred = outputs['shift_drug_cond']
-                    has_mdn_drug_shift = isinstance(outputs.get('shift_mdn_drug_cond', None), dict)
-                    if shift_log_transform_legacy and (not shift_log) and (not has_mdn_drug_shift):
-                        shift_drug_pred = torch.expm1(shift_drug_pred)
-                    if shift_drug_pred.dim() == 3:
-                        if shift_drug_pred.size(-1) == 1:
-                            shift_drug_pred = shift_drug_pred.squeeze(-1)
-                        else:
-                            shift_drug_pred = torch.argmax(shift_drug_pred, dim=-1).float()
-                    # Filter: only drug tokens AND valid shift tokens
-                    drug_shift_mask = shift_mask & drug_token_mask
-                    if drug_shift_mask.any():
-                        all_predictions_shift_drug_cond.append(shift_drug_pred[drug_shift_mask].float().cpu().numpy())
-                        all_targets_shift_drug_cond.append(batch_y_shift[drug_shift_mask].float().cpu().numpy())
+            # DOSE (drug-token only regression)
+            if dose_mask.any() and use_drug_conditioning and 'dose_drug_cond' in outputs:
+                dose_drug_pred = outputs['dose_drug_cond']
+                has_mdn_drug_dose = isinstance(outputs.get('dose_mdn_drug_cond', None), dict)
+                if dose_log_transform_legacy and (not dose_log) and (not has_mdn_drug_dose):
+                    dose_drug_pred = torch.expm1(dose_drug_pred)
+                if dose_drug_pred.dim() == 3:
+                    if dose_drug_pred.size(-1) == 1:
+                        dose_drug_pred = dose_drug_pred.squeeze(-1)
+                    else:
+                        dose_drug_pred = torch.argmax(dose_drug_pred, dim=-1).float()
+                drug_dose_mask = dose_mask & drug_token_mask
+                if drug_dose_mask.any():
+                    all_predictions_dose.append(dose_drug_pred[drug_dose_mask].float().cpu().numpy())
+                    all_targets_dose.append(batch_y_dose[drug_dose_mask].float().cpu().numpy())
 
-            # TOTAL (regression): store clipped predictions to match domain (non-negative)
-            if total_mask.any():
-                tp = total_pred[total_mask]
-                tt = batch_y_total[total_mask].float()
-                all_predictions['total'].append(torch.clamp(tp, min=0.0).cpu().numpy())
-                all_targets['total'].append(tt.cpu().numpy())
-                
-                # Drug-conditioned TOTAL (if available) - ONLY for drug tokens
-                # Create drug_total_mask BEFORE filtering by total_mask
-                if use_drug_conditioning and 'total_drug_cond' in outputs:
-                    # Filter: only drug tokens AND valid total tokens
-                    drug_total_mask = total_mask & drug_token_mask
-                    if drug_total_mask.any():
-                        # Apply drug_total_mask directly to outputs (before total_mask filtering)
-                        tp_drug = outputs['total_drug_cond'][drug_total_mask]
-                        has_mdn_drug_total = isinstance(outputs.get('total_mdn_drug_cond', None), dict)
-                        if total_log_transform and not has_mdn_drug_total:
-                            tp_drug = torch.expm1(tp_drug)
-                        tp_drug = torch.clamp(tp_drug, min=0.0)
-                        all_predictions_total_drug_cond.append(tp_drug.cpu().numpy())
-                        all_targets_total_drug_cond.append(batch_y_total[drug_total_mask].float().cpu().numpy())
+            # DURATION (drug-token only regression)
+            if dur_mask.any() and use_drug_conditioning and 'dur_drug_cond' in outputs:
+                drug_dur_mask = dur_mask & drug_token_mask
+                if drug_dur_mask.any():
+                    tp_drug = outputs['dur_drug_cond'][drug_dur_mask]
+                    has_mdn_drug_dur = isinstance(outputs.get('dur_mdn_drug_cond', None), dict)
+                    if dur_log_transform and not has_mdn_drug_dur:
+                        tp_drug = torch.expm1(tp_drug)
+                    tp_drug = torch.clamp(tp_drug, min=0.0)
+                    all_predictions_dur.append(tp_drug.cpu().numpy())
+                    all_targets_dur.append(batch_y_dur[drug_dur_mask].float().cpu().numpy())
 
-                total_pos = total_mask & (batch_y_total > 0)
-                if total_pos.any():
-                    tp_pos = total_pred[total_pos]
-                    tt_pos = batch_y_total[total_pos].float()
-                    all_predictions_pos['total'].append(torch.clamp(tp_pos, min=0.0).cpu().numpy())
-                    all_targets_pos['total'].append(tt_pos.cpu().numpy())
+            # ---- MDN NLL evaluation (drug-token only) ----
+            # DOSE MDN NLL
+            if use_drug_conditioning and 'dose_mdn_drug_cond' in outputs:
+                dose_mdn_drug_src = outputs['dose_mdn_drug_cond']
+                drug_dose_mask = dose_mask & drug_token_mask
+                if isinstance(dose_mdn_drug_src, dict) and drug_dose_mask.any():
+                    _pi = dose_mdn_drug_src['pi_logits'][drug_dose_mask]
+                    _mu = dose_mdn_drug_src['mu'][drug_dose_mask]
+                    _ls = dose_mdn_drug_src['log_s'][drug_dose_mask]
+                    _y = batch_y_dose[drug_dose_mask].float().unsqueeze(-1)
+                    _z = (_y - _mu) / torch.exp(_ls)
+                    _log_pdf = -_z - _ls - 2.0 * torch.nn.functional.softplus(-_z)
+                    _log_pi = torch.nn.functional.log_softmax(_pi, dim=-1)
+                    _nll = -torch.logsumexp(_log_pi + _log_pdf, dim=-1)
+                    _nll = torch.clamp(_nll, min=0.0, max=200.0)
+                    mdn_nll_dose_sum += float(_nll.sum().item())
+                    mdn_nll_dose_count += int(_nll.numel())
 
-    # Concatenate all batches (skip empty)
-    for field in ['shift', 'total']:
-        if len(all_predictions[field]) > 0:
-            all_predictions[field] = np.concatenate(all_predictions[field])
-            all_targets[field] = np.concatenate(all_targets[field])
-        else:
-            all_predictions[field] = np.array([])
-            all_targets[field] = np.array([])
+            # DURATION MDN NLL
+            if use_drug_conditioning and 'dur_mdn_drug_cond' in outputs:
+                dur_mdn_drug_src = outputs['dur_mdn_drug_cond']
+                drug_dur_mask = dur_mask & drug_token_mask
+                if isinstance(dur_mdn_drug_src, dict) and drug_dur_mask.any():
+                    _pi = dur_mdn_drug_src['pi_logits'][drug_dur_mask]
+                    _mu = dur_mdn_drug_src['mu'][drug_dur_mask]
+                    _ls = dur_mdn_drug_src['log_s'][drug_dur_mask]
+                    _y = batch_y_dur[drug_dur_mask].float().unsqueeze(-1)
+                    _z = (_y - _mu) / torch.exp(_ls)
+                    _log_pdf = -_z - _ls - 2.0 * torch.nn.functional.softplus(-_z)
+                    _log_pi = torch.nn.functional.log_softmax(_pi, dim=-1)
+                    _nll = -torch.logsumexp(_log_pi + _log_pdf, dim=-1)
+                    _nll = torch.clamp(_nll, min=0.0, max=50.0)
+                    mdn_nll_dur_sum += float(_nll.sum().item())
+                    mdn_nll_dur_count += int(_nll.numel())
 
-    for field in ['total']:
-        if len(all_predictions_pos[field]) > 0:
-            all_predictions_pos[field] = np.concatenate(all_predictions_pos[field])
-            all_targets_pos[field] = np.concatenate(all_targets_pos[field])
-        else:
-            all_predictions_pos[field] = np.array([])
-            all_targets_pos[field] = np.array([])
-    
-    if len(all_predictions_shift_drug_cond) > 0:
-        all_predictions_shift_drug_cond = np.concatenate(all_predictions_shift_drug_cond)
-        all_targets_shift_drug_cond = np.concatenate(all_targets_shift_drug_cond)
+    # Concatenate drug-token predictions
+    if len(all_predictions_dose) > 0:
+        all_predictions_dose = np.concatenate(all_predictions_dose)
+        all_targets_dose = np.concatenate(all_targets_dose)
     else:
-        all_predictions_shift_drug_cond = np.array([])
-        all_targets_shift_drug_cond = np.array([])
-    
-    if len(all_predictions_total_drug_cond) > 0:
-        all_predictions_total_drug_cond = np.concatenate(all_predictions_total_drug_cond)
-        all_targets_total_drug_cond = np.concatenate(all_targets_total_drug_cond)
+        all_predictions_dose = np.array([])
+        all_targets_dose = np.array([])
+
+    if len(all_predictions_dur) > 0:
+        all_predictions_dur = np.concatenate(all_predictions_dur)
+        all_targets_dur = np.concatenate(all_targets_dur)
     else:
-        all_predictions_total_drug_cond = np.array([])
-        all_targets_total_drug_cond = np.array([])
-    
+        all_predictions_dur = np.array([])
+        all_targets_dur = np.array([])
+
     posthoc_calibration = str(posthoc_calibration).lower()
 
-    # Calculate metrics
+    # Calculate metrics (drug-token only)
     results = {}
-    
-    # ============================================================
-    # SHIFT: REGRESSION METRICS
-    # ============================================================
-    if len(all_targets['shift']) > 0:
-        shift_pred = all_predictions['shift'].astype(np.float32)
-        shift_target = all_targets['shift'].astype(np.float32)
 
-        results['shift_mae'] = mean_absolute_error(shift_target, shift_pred)
-        results['shift_rmse'] = float(np.sqrt(mean_squared_error(shift_target, shift_pred)))
-        results['shift_median_ae'] = float(np.median(np.abs(shift_target - shift_pred)))
+    # ============================================================
+    # DOSE: REGRESSION METRICS (drug tokens only)
+    # ============================================================
+    if len(all_predictions_dose) > 0:
+        dose_pred = all_predictions_dose.astype(np.float32)
+        dose_target = all_targets_dose.astype(np.float32)
+        results['dose_mae'] = mean_absolute_error(dose_target, dose_pred)
+        results['dose_rmse'] = float(np.sqrt(mean_squared_error(dose_target, dose_pred)))
+        results['dose_median_ae'] = float(np.median(np.abs(dose_target - dose_pred)))
         try:
-            results['shift_r2'] = r2_score(shift_target, shift_pred)
+            results['dose_r2'] = r2_score(dose_target, dose_pred)
         except Exception:
-            results['shift_r2'] = np.nan
-        results['shift_mean_target'] = float(np.mean(shift_target))
-        results['shift_mean_pred'] = float(np.mean(shift_pred))
-        results['shift_std_target'] = float(np.std(shift_target))
-        results['shift_std_pred'] = float(np.std(shift_pred))
-        results['shift_support'] = int(len(shift_target))
+            results['dose_r2'] = np.nan
+        results['dose_mean_target'] = float(np.mean(dose_target))
+        results['dose_mean_pred'] = float(np.mean(dose_pred))
+        results['dose_support'] = int(len(dose_target))
 
         if posthoc_calibration == 'affine':
-            a_shift, b_shift = fit_affine_calibration(shift_pred, shift_target)
-            shift_pred_cal = apply_affine_calibration(shift_pred, a_shift, b_shift)
-            results['shift_calibration'] = 'affine'
-            results['shift_calibration_a'] = float(a_shift)
-            results['shift_calibration_b'] = float(b_shift)
-            results['shift_mae_calibrated'] = mean_absolute_error(shift_target, shift_pred_cal)
-            results['shift_rmse_calibrated'] = float(np.sqrt(mean_squared_error(shift_target, shift_pred_cal)))
-            results['shift_mean_pred_calibrated'] = float(np.mean(shift_pred_cal))
+            a_dose, b_dose = fit_affine_calibration(dose_pred, dose_target)
+            dose_pred_cal = apply_affine_calibration(dose_pred, a_dose, b_dose)
+            results['dose_calibration'] = 'affine'
+            results['dose_calibration_a'] = float(a_dose)
+            results['dose_calibration_b'] = float(b_dose)
+            results['dose_mae_calibrated'] = mean_absolute_error(dose_target, dose_pred_cal)
+            results['dose_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dose_target, dose_pred_cal)))
+            results['dose_mean_pred_calibrated'] = float(np.mean(dose_pred_cal))
 
         # Optional interpretability metric for near-discrete targets.
-        shift_target_round = np.rint(shift_target)
-        frac_integer_target = float(np.mean(np.isclose(shift_target, shift_target_round, atol=1e-6)))
+        dose_target_round = np.rint(dose_target)
+        frac_integer_target = float(np.mean(np.isclose(dose_target, dose_target_round, atol=1e-6)))
         if frac_integer_target > 0.95:
-            shift_pred_rounded = np.rint(np.clip(shift_pred, shift_min_eval, shift_max_eval)).astype(np.int64)
-            shift_target_int = shift_target.astype(np.int64)
-            results['shift_rounded_accuracy'] = accuracy_score(shift_target_int, shift_pred_rounded)
+            dose_pred_rounded = np.rint(np.clip(dose_pred, dose_min_eval, dose_max_eval)).astype(np.int64)
+            dose_target_int = dose_target.astype(np.int64)
+            results['dose_rounded_accuracy'] = accuracy_score(dose_target_int, dose_pred_rounded)
+        results['dose_note'] = drug_token_note
 
-        # Drug-conditioned SHIFT metrics (ONLY for drug tokens)
-        if len(all_predictions_shift_drug_cond) > 0:
-            shift_pred_drug = all_predictions_shift_drug_cond.astype(np.float32)
-            shift_target_drug = all_targets_shift_drug_cond.astype(np.float32)
-            results['shift_mae_drug_cond'] = mean_absolute_error(shift_target_drug, shift_pred_drug)
-            results['shift_rmse_drug_cond'] = float(np.sqrt(mean_squared_error(shift_target_drug, shift_pred_drug)))
-            results['shift_median_ae_drug_cond'] = float(np.median(np.abs(shift_target_drug - shift_pred_drug)))
-            try:
-                results['shift_r2_drug_cond'] = r2_score(shift_target_drug, shift_pred_drug)
-            except Exception:
-                results['shift_r2_drug_cond'] = np.nan
-            results['shift_mean_target_drug_cond'] = float(np.mean(shift_target_drug))
-            results['shift_mean_pred_drug_cond'] = float(np.mean(shift_pred_drug))
-            results['shift_support_drug_cond'] = int(len(shift_target_drug))
-            shift_drug_target_round = np.rint(shift_target_drug)
-            frac_integer_target_drug = float(np.mean(np.isclose(shift_target_drug, shift_drug_target_round, atol=1e-6)))
-            if frac_integer_target_drug > 0.95:
-                shift_drug_pred_rounded = np.rint(np.clip(shift_pred_drug, shift_min_eval, shift_max_eval)).astype(np.int64)
-                shift_drug_target_int = shift_target_drug.astype(np.int64)
-                results['shift_rounded_accuracy_drug_cond'] = accuracy_score(
-                    shift_drug_target_int,
-                    shift_drug_pred_rounded,
-                )
-            results['shift_drug_cond_note'] = drug_token_note
-    
     # ============================================================
-    # TOTAL: REGRESSION METRICS
+    # DURATION: REGRESSION METRICS (drug tokens only)
     # ============================================================
-    for field in ['total']:
-        if len(all_targets[field]) == 0:
-            continue
-            
-        pred = all_predictions[field]  # continuous regression output
-        target = all_targets[field]    # continuous target
-        
-        # Regression metrics
-        mae = mean_absolute_error(target, pred)
-        rmse = np.sqrt(mean_squared_error(target, pred))
-        median_ae = np.median(np.abs(target - pred))
-        
-        # R² score
+    if len(all_predictions_dur) > 0:
+        dur_pred_arr = all_predictions_dur.astype(np.float32)
+        dur_target_arr = all_targets_dur.astype(np.float32)
+        results['dur_mae'] = mean_absolute_error(dur_target_arr, dur_pred_arr)
+        results['dur_rmse'] = float(np.sqrt(mean_squared_error(dur_target_arr, dur_pred_arr)))
+        results['dur_median_ae'] = float(np.median(np.abs(dur_target_arr - dur_pred_arr)))
         try:
-            r2 = r2_score(target, pred)
-        except:
-            r2 = np.nan
-        
-        results[f'{field}_mae'] = mae
-        results[f'{field}_rmse'] = rmse
-        results[f'{field}_median_ae'] = median_ae
-        results[f'{field}_r2'] = r2
-        
-        # Additional stats
-        results[f'{field}_mean_target'] = np.mean(target)
-        results[f'{field}_mean_pred'] = np.mean(pred)
-        results[f'{field}_std_target'] = np.std(target)
-        results[f'{field}_std_pred'] = np.std(pred)
+            results['dur_r2'] = r2_score(dur_target_arr, dur_pred_arr)
+        except Exception:
+            results['dur_r2'] = np.nan
+        results['dur_mean_target'] = float(np.mean(dur_target_arr))
+        results['dur_mean_pred'] = float(np.mean(dur_pred_arr))
+        results['dur_support'] = int(len(dur_target_arr))
 
         if posthoc_calibration == 'affine':
-            a_total, b_total = fit_affine_calibration(pred, target)
-            pred_cal = apply_affine_calibration(pred, a_total, b_total)
-            results[f'{field}_calibration'] = 'affine'
-            results[f'{field}_calibration_a'] = float(a_total)
-            results[f'{field}_calibration_b'] = float(b_total)
-            results[f'{field}_mae_calibrated'] = mean_absolute_error(target, pred_cal)
-            results[f'{field}_rmse_calibrated'] = float(np.sqrt(mean_squared_error(target, pred_cal)))
-            results[f'{field}_mean_pred_calibrated'] = float(np.mean(pred_cal))
+            a_dur, b_dur = fit_affine_calibration(dur_pred_arr, dur_target_arr)
+            dur_pred_cal = apply_affine_calibration(dur_pred_arr, a_dur, b_dur)
+            results['dur_calibration'] = 'affine'
+            results['dur_calibration_a'] = float(a_dur)
+            results['dur_calibration_b'] = float(b_dur)
+            results['dur_mae_calibrated'] = mean_absolute_error(dur_target_arr, dur_pred_cal)
+            results['dur_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dur_target_arr, dur_pred_cal)))
+            results['dur_mean_pred_calibrated'] = float(np.mean(dur_pred_cal))
+        results['dur_note'] = drug_token_note
 
-        # Positive-only regression metrics (targets > 0)
-        if len(all_targets_pos[field]) > 0:
-            pred_pos = all_predictions_pos[field]
-            target_pos = all_targets_pos[field]
-            results[f'{field}_mae_pos'] = mean_absolute_error(target_pos, pred_pos)
-            results[f'{field}_rmse_pos'] = float(np.sqrt(mean_squared_error(target_pos, pred_pos)))
-            results[f'{field}_median_ae_pos'] = float(np.median(np.abs(target_pos - pred_pos)))
-            try:
-                results[f'{field}_r2_pos'] = r2_score(target_pos, pred_pos)
-            except:
-                results[f'{field}_r2_pos'] = np.nan
-            results[f'{field}_support_pos'] = int(len(target_pos))
+    # ============================================================
+    # MDN NLL METRICS (drug tokens only)
+    # ============================================================
+    if mdn_nll_dose_count > 0:
+        results['dose_mdn_nll'] = mdn_nll_dose_sum / mdn_nll_dose_count
+        results['dose_mdn_nll_support'] = mdn_nll_dose_count
+    if mdn_nll_dur_count > 0:
+        results['dur_mdn_nll'] = mdn_nll_dur_sum / mdn_nll_dur_count
+        results['dur_mdn_nll_support'] = mdn_nll_dur_count
 
-    # Drug-conditioned TOTAL metrics (ONLY for drug tokens)
-    if len(all_predictions_total_drug_cond) > 0:
-        pred_drug = all_predictions_total_drug_cond
-        tgt_drug = all_targets_total_drug_cond
-        results['total_mae_drug_cond'] = mean_absolute_error(tgt_drug, pred_drug)
-        results['total_rmse_drug_cond'] = float(np.sqrt(mean_squared_error(tgt_drug, pred_drug)))
-        results['total_median_ae_drug_cond'] = float(np.median(np.abs(tgt_drug - pred_drug)))
-        try:
-            results['total_r2_drug_cond'] = r2_score(tgt_drug, pred_drug)
-        except:
-            results['total_r2_drug_cond'] = np.nan
-        results['total_mean_target_drug_cond'] = float(np.mean(tgt_drug))
-        results['total_mean_pred_drug_cond'] = float(np.mean(pred_drug))
-        results['total_support_drug_cond'] = int(len(tgt_drug))
-        results['total_drug_cond_note'] = drug_token_note
-    
     return results
 
 
@@ -812,7 +747,7 @@ def evaluate_auc_pipeline(
         output_path (str | None): Directory where CSV files will be written. If None, files will not be saved.
         model_type (str): must be 'composite'
         diseases_of_interest (np.ndarray or list, optional): If provided, these disease indices are used.
-        filter_min_total (int): Minimum total token count to include a token.
+        filter_min_total (int): Minimum dur token count to include a token.
         disease_chunk_size (int): Maximum chunk size for processing diseases.
         age_groups (np.ndarray): Age groups to use in calibration.
         offset (float): Offset used in get_calibration_auc.
@@ -837,7 +772,7 @@ def evaluate_auc_pipeline(
     
     # Adjust vocab_size if labels indicate more tokens (e.g., Death token at 1289)
     # Note: labels_df indices are 0-based and represent raw data values.
-    # If max index is 1288 (Death raw), after +1 shift max token is 1289.
+    # If max index is 1288 (Death raw), after +1 dose max token is 1289.
     # We need vocab_size > 1289 (i.e. >= 1290) to include it.
     # Use model's vocab_size (trust the model config)
     vocab_size = config_vocab_size
@@ -864,7 +799,7 @@ def evaluate_auc_pipeline(
     # CRITICAL: Filter to only include tokens that actually exist in the evaluation data
     # This prevents evaluating tokens like SGLT-2 or Other that may not exist in val/test data
     target_data_np = d100k[4].cpu().detach().numpy()  # y_data (target DATA tokens)
-    # d100k = (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
+    # d100k = (x_data, x_dose, x_dur, x_ages, y_data, y_dose, y_dur, y_ages)
     
     actual_tokens_in_data = set(np.unique(target_data_np).tolist())
     # Remove invalid tokens like -1 (padding)
@@ -909,7 +844,7 @@ def evaluate_auc_pipeline(
     pred_idx_precompute = (d[1][:, :, np.newaxis] <= d[3][:, np.newaxis, :] - offset).sum(1) - 1
 
     all_aucs = []
-    tqdm_options = {"desc": "Processing disease chunks", "total": len(diseases_chunks)}
+    tqdm_options = {"desc": "Processing disease chunks", "duration": len(diseases_chunks)}
     for disease_chunk_idx, diseases_chunk in tqdm(enumerate(diseases_chunks), **tqdm_options):
         # Filter out invalid indices for this chunk
         diseases_chunk = np.array(diseases_chunk)
@@ -925,19 +860,19 @@ def evaluate_auc_pipeline(
         model.eval()
         with torch.no_grad():
             # Process the evaluation data in batches
-            x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
+            x_data, x_dose, x_dur, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
             num_batches = (x_data.shape[0] + batch_size - 1) // batch_size
             for batch_idx in tqdm(range(num_batches), desc=f"Model inference, chunk {disease_chunk_idx}"):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, x_data.shape[0])
 
                 batch_x_data = x_data[start_idx:end_idx].to(device)
-                batch_x_shift = x_shift[start_idx:end_idx].to(device)
-                batch_x_total = x_total[start_idx:end_idx].to(device)
+                batch_x_dose = x_dose[start_idx:end_idx].to(device)
+                batch_x_dur = x_dur[start_idx:end_idx].to(device)
                 batch_x_ages = x_ages[start_idx:end_idx].to(device)
 
                 outputs = model(
-                    batch_x_data, batch_x_shift, batch_x_total, batch_x_ages
+                    batch_x_data, batch_x_dose, batch_x_dur, batch_x_ages
                 )[0]  # Get logits dict
 
                 data_logits = outputs['data'].cpu().detach().numpy()
@@ -1039,10 +974,10 @@ def evaluate_auc_pipeline(
     else:
         df_auc_merged = df_auc.copy()
     
-    # Evaluate composite fields (SHIFT, TOTAL) if composite model and enabled
+    # Evaluate composite fields (DOSE, DURATION) if composite model and enabled
     composite_metrics = None
     if evaluate_composite:
-        print("\nEvaluating composite fields (SHIFT, TOTAL)...")
+        print("\nEvaluating composite fields (DOSE, DURATION)...")
         composite_metrics = evaluate_composite_fields(
             model, d100k, batch_size=batch_size, device=device, posthoc_calibration=posthoc_calibration
         )
@@ -1050,81 +985,61 @@ def evaluate_auc_pipeline(
         # Print results
         print("\nComposite Field Evaluation Results:")
         print("=" * 60)
-        
-        # SHIFT: regression
-        if 'shift_mae' in composite_metrics:
-            print("SHIFT:")
-            print(f"  MAE: {composite_metrics['shift_mae']:.4f}")
-            if 'shift_rmse' in composite_metrics:
-                print(f"  RMSE: {composite_metrics['shift_rmse']:.4f}")
-            if 'shift_median_ae' in composite_metrics:
-                print(f"  Median AE: {composite_metrics['shift_median_ae']:.4f}")
-            if 'shift_r2' in composite_metrics and not np.isnan(composite_metrics['shift_r2']):
-                print(f"  R²: {composite_metrics['shift_r2']:.4f}")
-            if 'shift_rounded_accuracy' in composite_metrics:
-                print(f"  Rounded Accuracy: {composite_metrics['shift_rounded_accuracy']:.4f}")
-            if 'shift_support' in composite_metrics:
-                print(f"  Support: {composite_metrics['shift_support']}")
-            if 'shift_mae_calibrated' in composite_metrics:
-                print(f"  MAE (calibrated): {composite_metrics['shift_mae_calibrated']:.4f}")
-                print(f"  RMSE (calibrated): {composite_metrics['shift_rmse_calibrated']:.4f}")
 
-            # Drug-conditioned SHIFT regression metrics (ONLY for configured drug token range)
-            if 'shift_mae_drug_cond' in composite_metrics:
-                shift_drug_note = composite_metrics.get('shift_drug_cond_note', 'Metrics computed only for configured drug token range')
-                print(f"\n  Drug-Conditioned ({shift_drug_note}):")
-                print(f"    MAE: {composite_metrics['shift_mae_drug_cond']:.4f}")
-                if 'shift_rmse_drug_cond' in composite_metrics:
-                    print(f"    RMSE: {composite_metrics['shift_rmse_drug_cond']:.4f}")
-                if 'shift_median_ae_drug_cond' in composite_metrics:
-                    print(f"    Median AE: {composite_metrics['shift_median_ae_drug_cond']:.4f}")
-                if 'shift_r2_drug_cond' in composite_metrics and not np.isnan(composite_metrics['shift_r2_drug_cond']):
-                    print(f"    R²: {composite_metrics['shift_r2_drug_cond']:.4f}")
-                if 'shift_rounded_accuracy_drug_cond' in composite_metrics:
-                    print(f"    Rounded Accuracy: {composite_metrics['shift_rounded_accuracy_drug_cond']:.4f}")
-                if 'shift_mean_target_drug_cond' in composite_metrics:
-                    print(f"    Mean Target: {composite_metrics['shift_mean_target_drug_cond']:.4f}")
-                if 'shift_mean_pred_drug_cond' in composite_metrics:
-                    print(f"    Mean Prediction: {composite_metrics['shift_mean_pred_drug_cond']:.4f}")
-                if 'shift_support_drug_cond' in composite_metrics:
-                    print(f"    Support: {composite_metrics['shift_support_drug_cond']}")
+        # DOSE regression metrics
+        if 'dose_mae' in composite_metrics:
+            print("DOSE:")
+            print(f"  MAE: {composite_metrics['dose_mae']:.4f}")
+            if 'dose_rmse' in composite_metrics:
+                print(f"  RMSE: {composite_metrics['dose_rmse']:.4f}")
+            if 'dose_median_ae' in composite_metrics:
+                print(f"  Median AE: {composite_metrics['dose_median_ae']:.4f}")
+            if 'dose_r2' in composite_metrics and not np.isnan(composite_metrics['dose_r2']):
+                print(f"  R²: {composite_metrics['dose_r2']:.4f}")
+            if 'dose_rounded_accuracy' in composite_metrics:
+                print(f"  Rounded Accuracy: {composite_metrics['dose_rounded_accuracy']:.4f}")
+            if 'dose_mean_target' in composite_metrics:
+                print(f"  Mean Target: {composite_metrics['dose_mean_target']:.4f}")
+            if 'dose_mean_pred' in composite_metrics:
+                print(f"  Mean Prediction: {composite_metrics['dose_mean_pred']:.4f}")
+            if 'dose_support' in composite_metrics:
+                print(f"  Support: {composite_metrics['dose_support']}")
+            if 'dose_mae_calibrated' in composite_metrics:
+                print(f"  MAE (calibrated): {composite_metrics['dose_mae_calibrated']:.4f}")
+                print(f"  RMSE (calibrated): {composite_metrics['dose_rmse_calibrated']:.4f}")
         else:
-            print("SHIFT:")
-            print("  n/a (no valid SHIFT targets under current filtering/mask)")
-        
-        # TOTAL: regression
-        field = 'total'
-        if f'{field}_mae' in composite_metrics:
-            print(f"{field.upper()}:")
-            print(f"  MAE: {composite_metrics[f'{field}_mae']:.4f}")
-            if f'{field}_rmse' in composite_metrics:
-                print(f"  RMSE: {composite_metrics[f'{field}_rmse']:.4f}")
-            if f'{field}_median_ae' in composite_metrics:
-                print(f"  Median AE: {composite_metrics[f'{field}_median_ae']:.4f}")
-            if f'{field}_r2' in composite_metrics and not np.isnan(composite_metrics[f'{field}_r2']):
-                print(f"  R²: {composite_metrics[f'{field}_r2']:.4f}")
-            if f'{field}_mae_pos' in composite_metrics:
-                print(f"  MAE (target>0): {composite_metrics[f'{field}_mae_pos']:.4f} (n={composite_metrics.get(f'{field}_support_pos', 'NA')})")
-            if f'{field}_mae_calibrated' in composite_metrics:
-                print(f"  MAE (calibrated): {composite_metrics[f'{field}_mae_calibrated']:.4f}")
-                print(f"  RMSE (calibrated): {composite_metrics[f'{field}_rmse_calibrated']:.4f}")
-            # TOTAL drug-conditioned extras (ONLY for configured drug token range)
-            if 'total_mae_drug_cond' in composite_metrics:
-                total_drug_note = composite_metrics.get('total_drug_cond_note', 'Metrics computed only for configured drug token range')
-                print(f"\n  Drug-Conditioned ({total_drug_note}):")
-                print(f"    MAE: {composite_metrics['total_mae_drug_cond']:.4f}")
-                if 'total_rmse_drug_cond' in composite_metrics:
-                    print(f"    RMSE: {composite_metrics['total_rmse_drug_cond']:.4f}")
-                if 'total_median_ae_drug_cond' in composite_metrics:
-                    print(f"    Median AE: {composite_metrics['total_median_ae_drug_cond']:.4f}")
-                if 'total_r2_drug_cond' in composite_metrics and not np.isnan(composite_metrics['total_r2_drug_cond']):
-                    print(f"    R²: {composite_metrics['total_r2_drug_cond']:.4f}")
-                if 'total_mean_target_drug_cond' in composite_metrics:
-                    print(f"    Mean Target: {composite_metrics['total_mean_target_drug_cond']:.4f}")
-                if 'total_mean_pred_drug_cond' in composite_metrics:
-                    print(f"    Mean Prediction: {composite_metrics['total_mean_pred_drug_cond']:.4f}")
-                if 'total_support_drug_cond' in composite_metrics:
-                    print(f"    Support: {composite_metrics['total_support_drug_cond']}")
+            print("DOSE: n/a")
+
+        # DURATION regression metrics
+        if 'dur_mae' in composite_metrics:
+            print("DURATION:")
+            print(f"  MAE: {composite_metrics['dur_mae']:.4f}")
+            if 'dur_rmse' in composite_metrics:
+                print(f"  RMSE: {composite_metrics['dur_rmse']:.4f}")
+            if 'dur_median_ae' in composite_metrics:
+                print(f"  Median AE: {composite_metrics['dur_median_ae']:.4f}")
+            if 'dur_r2' in composite_metrics and not np.isnan(composite_metrics['dur_r2']):
+                print(f"  R²: {composite_metrics['dur_r2']:.4f}")
+            if 'dur_mean_target' in composite_metrics:
+                print(f"  Mean Target: {composite_metrics['dur_mean_target']:.4f}")
+            if 'dur_mean_pred' in composite_metrics:
+                print(f"  Mean Prediction: {composite_metrics['dur_mean_pred']:.4f}")
+            if 'dur_support' in composite_metrics:
+                print(f"  Support: {composite_metrics['dur_support']}")
+            if 'dur_mae_calibrated' in composite_metrics:
+                print(f"  MAE (calibrated): {composite_metrics['dur_mae_calibrated']:.4f}")
+                print(f"  RMSE (calibrated): {composite_metrics['dur_rmse_calibrated']:.4f}")
+        else:
+            print("DURATION: n/a")
+
+        # MDN NLL metrics
+        has_any_nll = any(k in composite_metrics for k in ['dose_mdn_nll', 'dur_mdn_nll'])
+        if has_any_nll:
+            print("\nMDN NLL (lower = better):")
+            if 'dose_mdn_nll' in composite_metrics:
+                print(f"  DOSE: {composite_metrics['dose_mdn_nll']:.4f} (n={composite_metrics.get('dose_mdn_nll_support', 'NA')})")
+            if 'dur_mdn_nll' in composite_metrics:
+                print(f"  DURATION: {composite_metrics['dur_mdn_nll']:.4f} (n={composite_metrics.get('dur_mdn_nll_support', 'NA')})")
         print("=" * 60)
         
         # Save composite metrics
@@ -1180,7 +1095,7 @@ def main():
     parser.add_argument("--dataset_subset_size", type=int, default=10000, help="Dataset subset size for evaluation (-1 for all)")
     parser.add_argument("--n_bootstrap", type=int, default=1, help="Number of bootstrap samples")
     # Optional filtering/chunking parameters:
-    parser.add_argument("--filter_min_total", type=int, default=0, help="Minimum total count to filter tokens (0=include all)")
+    parser.add_argument("--filter_min_total", type=int, default=0, help="Minimum dur count to filter tokens (0=include all)")
     parser.add_argument("--disease_chunk_size", type=int, default=200, help="Chunk size for processing diseases")
     parser.add_argument("--labels_path", type=str, default=None, help="Path to labels CSV file")
     parser.add_argument("--block_size", type=int, default=80, help="Block size for data loading")
@@ -1216,24 +1131,24 @@ def main():
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = dict(checkpoint["model_args"])
     eval_apply_token_shift = bool(model_args.get('apply_token_shift', False))
-    eval_separate_shift_na = bool(model_args.get('separate_shift_na_from_padding', False))
-    eval_shift_na_raw_token = int(model_args.get('shift_na_raw_token', 4))
-    eval_shift_continuous = bool(model_args.get('shift_continuous', False))
-    eval_shift_log = bool(model_args.get('shift_log', False))
-    eval_shift_log_transform_legacy = bool(model_args.get('shift_log_transform', False))
-    eval_shift_min = float(model_args.get('shift_min_value', -1.0))
-    eval_shift_max = float(model_args.get('shift_max_value', -1.0))
-    eval_shift_input_scale = float(model_args.get('shift_input_scale', 1.0))
+    eval_separate_dose_na = bool(model_args.get('separate_dose_na_from_padding', False))
+    eval_dose_na_raw_token = int(model_args.get('dose_na_raw_token', 4))
+    eval_dose_continuous = bool(model_args.get('dose_continuous', False))
+    eval_dose_log = bool(model_args.get('dose_log', False))
+    eval_dose_log_transform_legacy = bool(model_args.get('dose_log_transform', False))
+    eval_dose_min = float(model_args.get('dose_min_value', -1.0))
+    eval_dose_max = float(model_args.get('dose_max_value', -1.0))
+    eval_dose_input_scale = float(model_args.get('dose_input_scale', 1.0))
     print(f"apply_token_shift from checkpoint: {eval_apply_token_shift}")
-    print(f"separate_shift_na_from_padding from checkpoint: {eval_separate_shift_na}")
-    print(f"shift_continuous from checkpoint: {eval_shift_continuous}")
-    print(f"shift_log from checkpoint: {eval_shift_log}")
-    print(f"shift_log_transform (legacy) from checkpoint: {eval_shift_log_transform_legacy}")
-    print(f"shift_range from checkpoint: [{eval_shift_min}, {eval_shift_max}]")
-    print(f"shift_input_scale from checkpoint: {eval_shift_input_scale}")
-    if eval_shift_continuous and eval_separate_shift_na:
-        print("[fix] shift_continuous=True -> forcing separate_shift_na_from_padding=False for evaluation")
-        eval_separate_shift_na = False
+    print(f"separate_dose_na_from_padding from checkpoint: {eval_separate_dose_na}")
+    print(f"dose_continuous from checkpoint: {eval_dose_continuous}")
+    print(f"dose_log from checkpoint: {eval_dose_log}")
+    print(f"dose_log_transform (legacy) from checkpoint: {eval_dose_log_transform_legacy}")
+    print(f"dose_range from checkpoint: [{eval_dose_min}, {eval_dose_max}]")
+    print(f"dose_input_scale from checkpoint: {eval_dose_input_scale}")
+    if eval_dose_continuous and eval_separate_dose_na:
+        print("[fix] dose_continuous=True -> forcing separate_dose_na_from_padding=False for evaluation")
+        eval_separate_dose_na = False
     if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
         model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
         model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288
@@ -1339,17 +1254,17 @@ def main():
 
     # Define dtype for composite data
     # IMPORTANT: Must match train_model.py exactly!
-    # Format: (ID, AGE, DATA, SHIFT, TOTAL) - NO DOSE, NO UNIT
+    # Format: (ID, AGE, DATA, DOSE, DURATION)
     composite_dtype = np.dtype([
         ('ID', np.uint32),
         ('AGE', np.uint32),
         ('DATA', np.uint32),
-        ('SHIFT', np.float32),
-        ('TOTAL', np.uint32)
+        ('DOSE', np.float32),
+        ('DURATION', np.uint32)
     ])
     
     # ============================================================
-    # DIAGNOSTIC: Check SHIFT values in raw data (before +1 shift)
+    # DIAGNOSTIC: Check DOSE values in raw data (before +1 dose)
     # Only run for first data file to avoid spam
     # ============================================================
     diagnostic_run = False
@@ -1425,7 +1340,7 @@ def main():
         else:
             current_subset_size = min(current_subset_size, len(data_p2i))
         
-        print(f"Using {current_subset_size} patients for evaluation (out of {len(data_p2i)} total)")
+        print(f"Using {current_subset_size} patients for evaluation (out of {len(data_p2i)} dur)")
         
         # Sample random patients for evaluation
         np.random.seed(seed)
@@ -1443,9 +1358,9 @@ def main():
             padding="random",
             no_event_token_rate=no_event_token_rate,
             apply_token_shift=eval_apply_token_shift,
-            shift_continuous=eval_shift_continuous,
-            separate_shift_na_from_padding=(eval_separate_shift_na and not eval_shift_continuous),
-            shift_na_raw_token=eval_shift_na_raw_token,
+            dose_continuous=eval_dose_continuous,
+            separate_dose_na_from_padding=(eval_separate_dose_na and not eval_dose_continuous),
+            dose_na_raw_token=eval_dose_na_raw_token,
         )
         
         # Prepare meta info with data source
@@ -1460,7 +1375,7 @@ def main():
             output_path=None,  # Don't save internally, we'll save with prefix
             labels_df=labels_df,
             model_type=model_type,
-            # UKB external validation: only AUC is needed (skip SHIFT/TOTAL)
+            # UKB external validation: only AUC is needed (skip DOSE/DURATION)
             evaluate_composite=(prefix != 'extval_ukb'),
             diseases_of_interest=None,
             filter_min_total=args.filter_min_total,

@@ -31,12 +31,11 @@ import csv
 import json
 import os
 import shlex
-import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 # Use a writable matplotlib cache dir in restricted environments.
 os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
@@ -44,13 +43,28 @@ os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from ablation._utils import (
+    as_float,
+    checkpoint_summary,
+    flatten_metrics,
+    fmt_metric,
+    get_repo_root,
+    load_existing_trials,
+    load_prefixed_metrics,
+    pick_best_trial,
+    resolve_checkpoint,
+    run_subprocess,
+    to_scalar,
+    write_csv,
+)
+
 
 # -----------------------------------------------------------------------------
 # Search space
 # -----------------------------------------------------------------------------
-BLOCK_SIZES = [128, 192, 256, 320, 384, 512]
-N_EMBD_VALUES = [288, 336, 384, 432, 480]
-N_LAYER_VALUES = [8, 10, 12, 14, 16]
+BLOCK_SIZES = [128, 256, 512]
+N_EMBD_VALUES = [288, 384, 480]
+N_LAYER_VALUES = [8, 12, 16]
 N_HEAD_VALUES = [8, 12, 16]
 TIME_DISTRIBUTIONS = ["exponential", "weibull"]
 FIXED_N_KV_HEAD = 4
@@ -65,106 +79,6 @@ class TrialSpec:
     n_head: int
     n_kv_head: int
     time_distribution: str
-
-
-def _run(cmd: Sequence[str], cwd: Path, env: Dict[str, str], log_path: Path) -> float:
-    """Run a command and tee stdout/stderr into a log file. Returns elapsed seconds."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    t0 = time.time()
-    with log_path.open("w", encoding="utf-8") as f:
-        f.write("$ " + " ".join(shlex.quote(c) for c in cmd) + "\n\n")
-        f.flush()
-        proc = subprocess.run(
-            list(cmd),
-            cwd=str(cwd),
-            env=env,
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    elapsed = time.time() - t0
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"Command failed ({proc.returncode}): {' '.join(cmd)}\nSee log: {log_path}"
-        )
-    return elapsed
-
-
-def _write_csv(rows: List[Dict[str, object]], path: Path) -> None:
-    keys = sorted({k for r in rows for k in r.keys()})
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=keys)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
-
-
-def _to_scalar(v):
-    if isinstance(v, (bool, int, float, str)):
-        return v
-    if isinstance(v, np.generic):
-        return v.item()
-    return None
-
-
-def _load_prefixed_metrics(eval_dir: Path) -> Dict[str, Dict]:
-    out: Dict[str, Dict] = {}
-    for fp in sorted(eval_dir.glob("*_composite_metrics.json")):
-        prefix = fp.name.replace("_composite_metrics.json", "")
-        with fp.open("r", encoding="utf-8") as f:
-            out[prefix] = json.load(f)
-    return out
-
-
-def _flatten_metrics(metrics_by_prefix: Dict[str, Dict]) -> Dict[str, object]:
-    row: Dict[str, object] = {}
-    for prefix, metrics in metrics_by_prefix.items():
-        for k, v in metrics.items():
-            s = _to_scalar(v)
-            if s is None:
-                continue
-            row[f"{prefix}.{k}"] = s
-    return row
-
-
-def _checkpoint_summary(ckpt_path: Path) -> Dict[str, object]:
-    import torch
-
-    ckpt = torch.load(str(ckpt_path), map_location="cpu")
-    model_state = ckpt.get("model", {})
-    model_args = ckpt.get("model_args", {})
-    cfg = ckpt.get("config", {})
-
-    num_params = int(sum(v.numel() for v in model_state.values()))
-
-    out = {
-        "checkpoint_iter": int(ckpt.get("iter_num", -1)),
-        "best_val_loss": float(ckpt.get("best_val_loss", np.nan)),
-        "num_params": num_params,
-        "num_params_m": float(num_params) / 1e6,
-        "shift_continuous_effective": bool(model_args.get("shift_continuous", False)),
-        "shift_log_effective": bool(model_args.get("shift_log", False)),
-        "shift_input_scale_effective": float(model_args.get("shift_input_scale", np.nan)),
-        "shift_min_value_effective": float(model_args.get("shift_min_value", np.nan)),
-        "shift_max_value_effective": float(model_args.get("shift_max_value", np.nan)),
-        "batch_size": int(cfg.get("batch_size", -1)),
-        "gradient_accumulation_steps": int(cfg.get("gradient_accumulation_steps", -1)),
-    }
-    return out
-
-
-def _resolve_checkpoint(train_out: Path) -> Path | None:
-    """Resolve best/periodic checkpoint path across naming variants."""
-    primary = [train_out / "ckpt.pt", train_out / "ckpt_composite.pt"]
-    for p in primary:
-        if p.exists():
-            return p
-    periodic = sorted(train_out.glob("ckpt_*.pt"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if periodic:
-        return periodic[0]
-    return None
 
 
 def _build_valid_combinations() -> List[Tuple[int, int, int, int, str]]:
@@ -231,129 +145,6 @@ def _load_sampled_trials(path: Path) -> List[TrialSpec]:
     return specs
 
 
-def _load_existing_trials(path: Path) -> List[Dict[str, object]]:
-    if not path.exists():
-        return []
-    rows: List[Dict[str, object]] = []
-    with path.open("r", encoding="utf-8", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            out: Dict[str, object] = dict(row)
-            # Normalize key fields used by resume and ranking logic.
-            if "trial_id" in out and str(out["trial_id"]).strip() != "":
-                out["trial_id"] = int(float(str(out["trial_id"])))
-            if "is_best" in out:
-                out["is_best"] = str(out["is_best"]).strip().lower() in {"1", "true", "yes"}
-            rows.append(out)
-    rows.sort(key=lambda r: int(r.get("trial_id", 0)))
-    return rows
-
-
-def _as_float(x) -> float:
-    try:
-        v = float(x)
-    except Exception:
-        return float("nan")
-    if not np.isfinite(v):
-        return float("nan")
-    return v
-
-
-def _fmt_metric(x, digits: int = 4) -> str:
-    v = _as_float(x)
-    if np.isfinite(v):
-        return f"{v:.{digits}f}"
-    return "nan"
-
-
-def _pick_best_trial(rows: List[Dict[str, object]]) -> int:
-    """
-    Return index in rows according to ranking:
-      1) max val.auc_mean
-      2) min mean(norm(val.shift_rmse_drug_cond), norm(val.total_rmse_drug_cond))
-      3) max val.shift_r2_drug_cond
-      4) max val.total_r2_drug_cond
-      5) min best_val_loss
-    """
-    valid_idxs = [
-        i
-        for i, r in enumerate(rows)
-        if str(r.get("status", "")) == "success" and np.isfinite(_as_float(r.get("val.auc_mean")))
-    ]
-    if not valid_idxs:
-        return -1
-
-    # Step 1: AUC max (with tolerance)
-    auc_vals = np.array([_as_float(rows[i].get("val.auc_mean")) for i in valid_idxs], dtype=float)
-    auc_max = float(np.nanmax(auc_vals))
-    tie = [i for i in valid_idxs if abs(_as_float(rows[i].get("val.auc_mean")) - auc_max) <= 1e-6]
-
-    if len(tie) == 1:
-        return tie[0]
-
-    # Step 2: normalized average RMSE score (lower better)
-    shift_key = "val.shift_rmse_drug_cond"
-    total_key = "val.total_rmse_drug_cond"
-    shift_vals = np.array([_as_float(rows[i].get(shift_key)) for i in tie], dtype=float)
-    total_vals = np.array([_as_float(rows[i].get(total_key)) for i in tie], dtype=float)
-
-    def _normalize(vals: np.ndarray) -> np.ndarray:
-        out = np.full_like(vals, fill_value=np.nan, dtype=float)
-        finite = np.isfinite(vals)
-        if not finite.any():
-            return np.full_like(vals, fill_value=1.0, dtype=float)
-        vmin = float(np.nanmin(vals[finite]))
-        vmax = float(np.nanmax(vals[finite]))
-        if vmax - vmin <= 1e-12:
-            out[finite] = 0.0
-        else:
-            out[finite] = (vals[finite] - vmin) / (vmax - vmin)
-        out[~finite] = 1.0
-        return out
-
-    shift_norm = _normalize(shift_vals)
-    total_norm = _normalize(total_vals)
-    score = 0.5 * shift_norm + 0.5 * total_norm
-    best_score = float(np.nanmin(score))
-    tie2 = [tie[j] for j, s in enumerate(score) if abs(float(s) - best_score) <= 1e-12]
-
-    if len(tie2) == 1:
-        return tie2[0]
-
-    # Step 3: max shift R2
-    shift_r2_key = "val.shift_r2_drug_cond"
-    shift_r2_vals = np.array([_as_float(rows[i].get(shift_r2_key)) for i in tie2], dtype=float)
-    if np.isfinite(shift_r2_vals).any():
-        smax = float(np.nanmax(shift_r2_vals))
-        tie3 = [tie2[j] for j, v in enumerate(shift_r2_vals) if np.isfinite(v) and abs(float(v) - smax) <= 1e-12]
-    else:
-        tie3 = tie2
-
-    if len(tie3) == 1:
-        return tie3[0]
-
-    # Step 4: max total R2
-    total_r2_key = "val.total_r2_drug_cond"
-    total_r2_vals = np.array([_as_float(rows[i].get(total_r2_key)) for i in tie3], dtype=float)
-    if np.isfinite(total_r2_vals).any():
-        tmax = float(np.nanmax(total_r2_vals))
-        tie4 = [tie3[j] for j, v in enumerate(total_r2_vals) if np.isfinite(v) and abs(float(v) - tmax) <= 1e-12]
-    else:
-        tie4 = tie3
-
-    if len(tie4) == 1:
-        return tie4[0]
-
-    # Step 5: min best_val_loss
-    bvl = np.array([_as_float(rows[i].get("best_val_loss")) for i in tie4], dtype=float)
-    if np.isfinite(bvl).any():
-        bmin = float(np.nanmin(bvl))
-        tie5 = [tie4[j] for j, v in enumerate(bvl) if np.isfinite(v) and abs(float(v) - bmin) <= 1e-12]
-        return tie5[0]
-
-    return tie4[0]
-
-
 def _plot_parallel_coords(rows: List[Dict[str, object]], out_png: Path) -> None:
     """Plot image-a-like parallel coordinates colored by best_val_loss."""
     valid_rows = [r for r in rows if str(r.get("status", "")) == "success"]
@@ -368,8 +159,8 @@ def _plot_parallel_coords(rows: List[Dict[str, object]], out_png: Path) -> None:
         ("num_params_m", "Parameters (M)"),
     ]
 
-    data = {k: np.array([_as_float(r.get(k)) for r in valid_rows], dtype=float) for k, _ in dims}
-    losses = np.array([_as_float(r.get("best_val_loss")) for r in valid_rows], dtype=float)
+    data = {k: np.array([as_float(r.get(k)) for r in valid_rows], dtype=float) for k, _ in dims}
+    losses = np.array([as_float(r.get("best_val_loss")) for r in valid_rows], dtype=float)
 
     finite_losses = losses[np.isfinite(losses)]
     if finite_losses.size == 0:
@@ -412,7 +203,7 @@ def _plot_parallel_coords(rows: List[Dict[str, object]], out_png: Path) -> None:
     if best_candidates:
         best = best_candidates[0]
         yb = np.array([
-            (0.0 if axis_lims[k][1] - axis_lims[k][0] <= 1e-12 else (_as_float(best.get(k)) - axis_lims[k][0]) / (axis_lims[k][1] - axis_lims[k][0]))
+            (0.0 if axis_lims[k][1] - axis_lims[k][0] <= 1e-12 else (as_float(best.get(k)) - axis_lims[k][0]) / (axis_lims[k][1] - axis_lims[k][0]))
             for k, _ in dims
         ])
         ax.plot(x, yb, color="#FDE725", linewidth=2.8, alpha=1.0, zorder=5)
@@ -456,7 +247,7 @@ def main() -> None:
     parser.add_argument("--output_root", type=str, default="ablation/hparam_screen", help="Root output dir")
     parser.add_argument("--run_name", type=str, default="screen_80_trials", help="Run subdirectory name")
 
-    parser.add_argument("--n_trials", type=int, default=80, help="Number of sampled trials")
+    parser.add_argument("--n_trials", type=int, default=162, help="Number of sampled trials")
     parser.add_argument("--sample_seed", type=int, default=42, help="Random seed for combo sampling")
     parser.add_argument("--trial_seed_base", type=int, default=1337, help="Base seed for train trials")
     parser.add_argument(
@@ -520,7 +311,7 @@ def main() -> None:
     if args.eval_interval <= 0:
         raise ValueError("eval_interval must be > 0")
 
-    repo_root = Path(__file__).resolve().parent
+    repo_root = get_repo_root()
     run_root = (repo_root / args.output_root / args.run_name).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
 
@@ -554,7 +345,7 @@ def main() -> None:
                     "time_distribution": s.time_distribution,
                 }
             )
-        _write_csv(sampled_rows, sampled_csv)
+        write_csv(sampled_rows, sampled_csv)
     print("=" * 72, flush=True)
     print("Hyperparameter screening started", flush=True)
     print(f"Run root: {run_root}", flush=True)
@@ -587,7 +378,7 @@ def main() -> None:
     extra_eval = shlex.split(args.extra_eval_args) if args.extra_eval_args.strip() else []
 
     trials_csv = run_root / "trials.csv"
-    existing_rows = _load_existing_trials(trials_csv)
+    existing_rows = load_existing_trials(trials_csv)
     sampled_ids = {s.trial_id for s in specs}
     trial_rows_by_id: Dict[int, Dict[str, object]] = {
         int(r.get("trial_id", 0)): dict(r)
@@ -616,7 +407,7 @@ def main() -> None:
         train_log = logs_dir / "train.log"
         eval_log = logs_dir / "eval.log"
         ckpt_path = train_out / "ckpt.pt"
-        existing_ckpt = _resolve_checkpoint(train_out)
+        existing_ckpt = resolve_checkpoint(train_out)
         existing_row = trial_rows_by_id.get(spec.trial_id)
         retry_eval_this_trial = (
             args.retry_eval_from_existing_ckpt
@@ -728,13 +519,13 @@ def main() -> None:
                         f"--wandb_project={args.wandb_project}",
                         f"--wandb_run_name={args.wandb_run_name}_trial_{spec.trial_id:03d}",
                     ]
-                train_seconds = _run(train_cmd, cwd=repo_root, env=env, log_path=train_log)
+                train_seconds = run_subprocess(train_cmd, cwd=repo_root, env=env, log_path=train_log)
                 print(
                     f"[trial {trial_idx}/{total_trials}] Training done in {train_seconds:.1f}s",
                     flush=True,
                 )
 
-            resolved_ckpt = existing_ckpt if retry_eval_this_trial else _resolve_checkpoint(train_out)
+            resolved_ckpt = existing_ckpt if retry_eval_this_trial else resolve_checkpoint(train_out)
             if resolved_ckpt is None:
                 raise FileNotFoundError(
                     f"Checkpoint not found under {train_out} "
@@ -743,14 +534,14 @@ def main() -> None:
             ckpt_path = resolved_ckpt
             row["checkpoint_path"] = str(ckpt_path)
 
-            ckpt_info = _checkpoint_summary(ckpt_path)
+            ckpt_info = checkpoint_summary(ckpt_path)
             row.update(ckpt_info)
             print(
                 (
                     f"[trial {trial_idx}/{total_trials}] Checkpoint loaded: "
                     f"iter={row.get('checkpoint_iter')}, "
-                    f"best_val_loss={_fmt_metric(row.get('best_val_loss'))}, "
-                    f"num_params_m={_fmt_metric(row.get('num_params_m'), 2)}"
+                    f"best_val_loss={fmt_metric(row.get('best_val_loss'))}, "
+                    f"num_params_m={fmt_metric(row.get('num_params_m'), 2)}"
                 ),
                 flush=True,
             )
@@ -779,22 +570,22 @@ def main() -> None:
                     f"--eval_batch_size={args.eval_batch_size}",
                     f"--data_files={args.data_files}",
                 ] + extra_eval
-                eval_seconds = _run(eval_cmd, cwd=repo_root, env=env, log_path=eval_log)
-                metrics_by_prefix = _load_prefixed_metrics(eval_out)
+                eval_seconds = run_subprocess(eval_cmd, cwd=repo_root, env=env, log_path=eval_log)
+                metrics_by_prefix = load_prefixed_metrics(eval_out)
                 print(
                     f"[trial {trial_idx}/{total_trials}] Evaluation done in {eval_seconds:.1f}s",
                     flush=True,
                 )
 
-            row.update(_flatten_metrics(metrics_by_prefix))
+            row.update(flatten_metrics(metrics_by_prefix))
             row["status"] = "success"
             print(
                 (
                     f"[trial {trial_idx}/{total_trials}] RESULT "
-                    f"val.auc_mean={_fmt_metric(row.get('val.auc_mean'))}, "
-                    f"val.shift_rmse_drug_cond={_fmt_metric(row.get('val.shift_rmse_drug_cond'))}, "
-                    f"val.total_rmse_drug_cond={_fmt_metric(row.get('val.total_rmse_drug_cond'))}, "
-                    f"best_val_loss={_fmt_metric(row.get('best_val_loss'))}"
+                    f"val.auc_mean={fmt_metric(row.get('val.auc_mean'))}, "
+                    f"val.dose_rmse={fmt_metric(row.get('val.dose_rmse'))}, "
+                    f"val.dur_rmse={fmt_metric(row.get('val.dur_rmse'))}, "
+                    f"best_val_loss={fmt_metric(row.get('best_val_loss'))}"
                 ),
                 flush=True,
             )
@@ -815,7 +606,7 @@ def main() -> None:
             row["total_seconds"] = float(time.time() - t_total0)
             trial_rows_by_id[spec.trial_id] = row
             trial_rows = [trial_rows_by_id[tid] for tid in sorted(trial_rows_by_id.keys())]
-            _write_csv(trial_rows, trials_csv)
+            write_csv(trial_rows, trials_csv)
             ok = sum(1 for r in trial_rows if str(r.get("status", "")) == "success")
             fail = len(trial_rows) - ok
             print(
@@ -827,14 +618,14 @@ def main() -> None:
     trial_rows = [trial_rows_by_id[tid] for tid in sorted(trial_rows_by_id.keys())]
 
     # Pick best trial
-    best_idx = _pick_best_trial(trial_rows)
+    best_idx = pick_best_trial(trial_rows)
     best_row = None
     if best_idx >= 0:
         trial_rows[best_idx]["is_best"] = True
         best_row = trial_rows[best_idx]
 
     # Rewrite CSV with is_best updated
-    _write_csv(trial_rows, trials_csv)
+    write_csv(trial_rows, trials_csv)
 
     # Save best trial json
     with (run_root / "best_trial.json").open("w", encoding="utf-8") as f:
@@ -855,10 +646,10 @@ def main() -> None:
         print(
             (
                 f"Best trial id={best_row.get('trial_id')} "
-                f"(val.auc_mean={_fmt_metric(best_row.get('val.auc_mean'))}, "
-                f"val.shift_rmse_drug_cond={_fmt_metric(best_row.get('val.shift_rmse_drug_cond'))}, "
-                f"val.total_rmse_drug_cond={_fmt_metric(best_row.get('val.total_rmse_drug_cond'))}, "
-                f"best_val_loss={_fmt_metric(best_row.get('best_val_loss'))})"
+                f"(val.auc_mean={fmt_metric(best_row.get('val.auc_mean'))}, "
+                f"val.dose_rmse={fmt_metric(best_row.get('val.dose_rmse'))}, "
+                f"val.dur_rmse={fmt_metric(best_row.get('val.dur_rmse'))}, "
+                f"best_val_loss={fmt_metric(best_row.get('best_val_loss'))})"
             ),
             flush=True,
         )

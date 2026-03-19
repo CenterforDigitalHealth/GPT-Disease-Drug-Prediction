@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Ablation runner for loss variance normalization only.
+Ablation runner for drug-token-only regression.
 
 - Training:   train_model
 - Evaluation: evaluate_auc
 
-Screens loss_normalize_by_variance: false, true
+Screens drug_token_only_regression and drug_token_loss_weight combinations:
+  1. Baseline:   drug_token_only_regression=False, drug_token_loss_weight=1.0
+  2. Drug-only:  drug_token_only_regression=True,  drug_token_loss_weight=1.0
+  3. Weighted 5x: drug_token_only_regression=False, drug_token_loss_weight=5.0
+  4. Weighted 10x: drug_token_only_regression=False, drug_token_loss_weight=10.0
 
 Per trial artifacts:
   - train/eval logs
@@ -25,7 +29,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from ablation._utils import (
     get_repo_root,
@@ -36,7 +40,6 @@ from ablation._utils import (
     flatten_metrics,
     resolve_checkpoint,
     checkpoint_summary,
-    parse_bool_list,
     parse_gpu_ids,
     build_env,
     ensure_ddp_compatible,
@@ -46,24 +49,34 @@ from ablation._utils import (
 )
 
 
+# (drug_token_only_regression, drug_token_loss_weight, short_name)
+DEFAULT_CONDITIONS: List[Tuple[bool, float, str]] = [
+    (False, 1.0, "baseline"),
+    (True, 1.0, "drug_only"),
+    (False, 5.0, "weighted_5x"),
+    (False, 10.0, "weighted_10x"),
+]
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ablation: loss normalization only")
+    parser = argparse.ArgumentParser(description="Ablation: drug-token-only regression")
     parser.add_argument("--gpu_ids", type=str, default="0", help="CUDA_VISIBLE_DEVICES value")
     parser.add_argument("--input_path", type=str, default="../data", help="Data root for evaluation")
-    parser.add_argument("--output_root", type=str, default="ablation/loss_normalization", help="Root output dir")
+    parser.add_argument("--output_root", type=str, default="ablation/drug_token_regression", help="Root output dir")
     parser.add_argument("--run_name", type=str, default="default", help="Run subdirectory name")
-    parser.add_argument(
-        "--loss_norm_flags",
-        type=str,
-        default="false,true",
-        help="Comma-separated loss_normalize_by_variance values to screen",
-    )
     parser.add_argument(
         "--fixed_label_scaling",
         type=str,
         default="none",
         choices=["none", "zscore", "robust", "minmax"],
         help="Fixed label_scaling value for all trials",
+    )
+    parser.add_argument(
+        "--fixed_loss_norm",
+        type=str,
+        default="false",
+        choices=["true", "false"],
+        help="Fixed loss_normalize_by_variance value for all trials",
     )
     parser.add_argument(
         "--fixed_posthoc_calibration",
@@ -102,15 +115,17 @@ def main() -> None:
     parser.add_argument(
         "--wandb_run_name",
         type=str,
-        default="ablation_loss_normalization",
+        default="ablation_drug_token_regression",
         help="Base run name forwarded to train_model (trial suffix added)",
     )
     args = parser.parse_args()
 
     # ---- Validate ----
-    flags = parse_bool_list(args.loss_norm_flags)
     if args.resume_from_trial_id <= 0:
         raise ValueError("resume_from_trial_id must be >= 1")
+
+    conditions = DEFAULT_CONDITIONS
+    loss_norm = args.fixed_loss_norm == "true"
 
     # ---- Paths ----
     repo_root = get_repo_root()
@@ -128,10 +143,11 @@ def main() -> None:
     ensure_ddp_compatible(extra_train, gpu_ids)
 
     print("=" * 72, flush=True)
-    print("Loss normalization ablation started", flush=True)
+    print("Drug-token regression ablation started", flush=True)
     print(f"Run root: {run_root}", flush=True)
-    print(f"Flags to screen: {flags}", flush=True)
+    print(f"Conditions: {[(c[2], c[0], c[1]) for c in conditions]}", flush=True)
     print(f"Fixed label_scaling: {args.fixed_label_scaling}", flush=True)
+    print(f"Fixed loss_normalize_by_variance: {loss_norm}", flush=True)
     print(f"Fixed posthoc_calibration: {args.fixed_posthoc_calibration}", flush=True)
     print(
         f"CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']} "
@@ -149,11 +165,11 @@ def main() -> None:
     }
 
     # ---- Trial loop ----
-    total_trials = len(flags)
+    total_trials = len(conditions)
 
-    for trial_idx, flag in enumerate(flags, start=1):
+    for trial_idx, (drug_only, drug_weight, short_name) in enumerate(conditions, start=1):
         trial_id = trial_idx
-        trial_name = f"t{trial_id:02d}_loss_norm-{int(flag)}"
+        trial_name = f"t{trial_id:02d}_drug_token-{short_name}"
         trial_root = run_root / trial_name
         train_out = trial_root / "train_out"
         eval_out = trial_root / "eval_out"
@@ -188,7 +204,8 @@ def main() -> None:
         start_tag = "RETRY-EVAL" if retry_eval_this_trial else "START"
         print(
             f"\n[trial {trial_idx}/{total_trials}] {start_tag} "
-            f"(id={trial_id:02d}) loss_normalize_by_variance={flag}",
+            f"(id={trial_id:02d}) {short_name}: "
+            f"drug_token_only_regression={drug_only}, drug_token_loss_weight={drug_weight}",
             flush=True,
         )
 
@@ -203,8 +220,10 @@ def main() -> None:
             "status": "running",
             "error_message": "",
             "is_best": False,
-            "loss_normalize_by_variance": flag,
+            "drug_token_only_regression": drug_only,
+            "drug_token_loss_weight": drug_weight,
             "label_scaling": args.fixed_label_scaling,
+            "loss_normalize_by_variance": loss_norm,
             "posthoc_calibration": args.fixed_posthoc_calibration,
             "visible_gpu_count": len(gpu_ids),
             "visible_gpu_ids": env["CUDA_VISIBLE_DEVICES"],
@@ -240,7 +259,9 @@ def main() -> None:
                     f"--max_iters={args.max_iters}",
                     f"--eval_interval={args.eval_interval}",
                     f"--label_scaling={args.fixed_label_scaling}",
-                    f"--loss_normalize_by_variance={flag}",
+                    f"--loss_normalize_by_variance={loss_norm}",
+                    f"--drug_token_only_regression={drug_only}",
+                    f"--drug_token_loss_weight={drug_weight}",
                 ] + extra_train
                 if args.wandb_log:
                     train_cmd += [
@@ -351,7 +372,7 @@ def main() -> None:
     success_count = sum(1 for r in trial_rows if str(r.get("status", "")) == "success")
     failed_count = len(trial_rows) - success_count
     print("\n" + "=" * 72, flush=True)
-    print("Loss normalization ablation completed.", flush=True)
+    print("Drug-token regression ablation completed.", flush=True)
     print(f"Trials summary: success={success_count}, failed={failed_count}", flush=True)
     if best_row is not None:
         print(

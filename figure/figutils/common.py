@@ -53,7 +53,7 @@ def load_model(ckpt_path, device='cpu', strip_prefix=True):
     checkpoint : dict
         Raw checkpoint dictionary (contains 'model_args', 'iter_num', etc.).
     """
-    from model_v6 import CompositeDelphi, CompositeDelphiConfig
+    from model import CompositeDelphi, CompositeDelphiConfig
 
     print(f"[INFO] Loading model from {ckpt_path} → {device}")
     checkpoint = torch.load(ckpt_path, map_location=device)
@@ -78,34 +78,34 @@ def load_model(ckpt_path, device='cpu', strip_prefix=True):
     if has_mdn_shift and not has_binary_change:
         # v7: MDN continuous shift
         try:
-            from model_v7 import CompositeDelphi, CompositeDelphiConfig
+            from model import CompositeDelphi, CompositeDelphiConfig
             print("[INFO] Detected MDN ShiftHead → using model_v7")
         except ImportError:
             try:
-                from model_v2 import CompositeDelphi, CompositeDelphiConfig
+                from model import CompositeDelphi, CompositeDelphiConfig
                 print("[WARN] model_v7 not found, trying model_v2")
             except ImportError:
-                from model_v6 import CompositeDelphi, CompositeDelphiConfig
+                from model import CompositeDelphi, CompositeDelphiConfig
                 print("[WARN] model_v7/v2 not found, falling back to model")
     elif has_binary_change:
         # v2: BinaryChangeHead
         try:
-            from model_v2 import CompositeDelphi, CompositeDelphiConfig
+            from model import CompositeDelphi, CompositeDelphiConfig
             print("[INFO] Detected BinaryChangeHead → using model_v2")
         except ImportError:
-            from model_v6 import CompositeDelphi, CompositeDelphiConfig
+            from model import CompositeDelphi, CompositeDelphiConfig
             print("[WARN] model_v2 not found, falling back to model")
     elif has_hierarchical:
         # v3: HierarchicalShiftHead
         try:
-            from model_v3 import CompositeDelphi, CompositeDelphiConfig
+            from model import CompositeDelphi, CompositeDelphiConfig
             print("[INFO] Detected HierarchicalShiftHead → using model_v3")
         except ImportError:
-            from model_v6 import CompositeDelphi, CompositeDelphiConfig
+            from model import CompositeDelphi, CompositeDelphiConfig
             print("[WARN] model_v3 not found, falling back to model")
     else:
         # v1: Original nn.Sequential shift_head
-        from model_v6 import CompositeDelphi, CompositeDelphiConfig
+        from model import CompositeDelphi, CompositeDelphiConfig
         print("[INFO] Detected original Sequential ShiftHead → using model")
 
     # Filter model_args to only include fields defined in CompositeDelphiConfig

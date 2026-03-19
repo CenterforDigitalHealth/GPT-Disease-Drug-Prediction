@@ -165,43 +165,43 @@ _arch_before_configurator = {k: globals()[k] for k in MODEL_SIZE_KEYS}
 
 # Composite Delphi model config (5-column data)
 data_vocab_size = 1290   # DATA: 약품/질병 코드 수 (Classification)
-shift_vocab_size = 5     # Legacy discrete SHIFT embedding size (unused when shift_continuous=True)
-total_vocab_size = 552   # TOTAL: Embedding vocab
+dose_vocab_size = 5     # Legacy discrete DOSE embedding size (unused when dose_continuous=True)
+dur_vocab_size = 552   # DURATION: Embedding vocab
 
-# SHIFT continuous regression settings
-shift_continuous = True
-shift_log = False                # if True: train SHIFT head on log1p(target) in continuous mode
-shift_input_scale = -1.0         # <=0: auto from train data
-shift_min_value = 0.0
-shift_max_value = -1.0           # <=0: auto from train data percentile
-shift_auto_min_percentile = 0.5  # used when shift_max_value <= shift_min_value
-shift_auto_max_percentile = 99.5 # set 100.0 to use observed max
-shift_exclude_na_token = True
-shift_mdn_nll_weight = 0.05
+# DOSE continuous regression settings
+dose_continuous = True
+dose_log = False                # if True: train DOSE head on log1p(target) in continuous mode
+dose_input_scale = -1.0         # <=0: auto from train data
+dose_min_value = 0.0
+dose_max_value = -1.0           # <=0: auto from train data percentile
+dose_auto_min_percentile = 0.5  # used when dose_max_value <= dose_min_value
+dose_auto_max_percentile = 100.0 # use observed max (was 99.5)
+dose_exclude_na_token = True
+dose_mdn_nll_weight = 0.05
 label_scaling = 'none'  # 'none' | 'zscore' | 'robust' | 'minmax'
 loss_normalize_by_variance = False
 
-# SHIFT legacy imbalance options (kept for compatibility; ignored in continuous mode)
-shift_loss_type = 'dice_focal'      # 'dice_focal', 'focal', 'ce'
-shift_dice_weight = 0.5
-shift_ignore_index = -1
-shift_focal_gamma = 2.0  # Reduced from 5.0 to standard value to prevent hallucinations
-shift_class_weights = []  # Empty list = unweighted
-shift_maintain_idx = 2
-shift_change_weight_max = 10.0
-shift_class_weight_cap = 8.0
+# DOSE legacy imbalance options (kept for compatibility; ignored in continuous mode)
+dose_loss_type = 'dice_focal'      # 'dice_focal', 'focal', 'ce'
+dose_dice_weight = 0.5
+dose_ignore_index = -1
+dose_focal_gamma = 2.0  # Reduced from 5.0 to standard value to prevent hallucinations
+dose_class_weights = []  # Empty list = unweighted
+dose_maintain_idx = 2
+dose_change_weight_max = 10.0
+dose_class_weight_cap = 8.0
 change_vocab_size = 2
 
-# TOTAL MDN settings
+# DURATION MDN settings
 mdn_n_components = 8
-total_min_value = 0.0
-total_max_value = 550.0
+dur_min_value = 0.0
+dur_max_value = 550.0
 
 # Loss weights for composite model
 loss_weight_data = 1.0
-loss_weight_shift = 20.0
+loss_weight_dose = 20.0
 loss_weight_change = 0.0
-loss_weight_total = 5.0
+loss_weight_durationation = 5.0
 loss_weight_time = 1.0
 
 # architecture features
@@ -212,10 +212,12 @@ sliding_window = 128
 
 # Drug-conditioning
 use_drug_conditioning = True
+drug_token_only_regression = False
+drug_token_loss_weight = 1.0
 rope_theta = 10000.0
 
-# TOTAL regression (legacy fallback only; MDN path does not use this)
-total_log_transform = False
+# DURATION regression (legacy fallback only; MDN path does not use this)
+dur_log_transform = False
 
 # adamw optimizer
 learning_rate = 6e-4
@@ -250,8 +252,8 @@ ignore_tokens = [0]
 data_fraction = 1.0
 no_event_token_rate = 5
 apply_token_shift = False
-separate_shift_na_from_padding = True
-shift_na_raw_token = 4
+separate_dose_na_from_padding = True
+dose_na_raw_token = 4
 
 # Time-to-Event distribution: 'exponential' or 'weibull'
 time_distribution = 'exponential'
@@ -274,15 +276,15 @@ if _cli_model_size is None:
         if _arch_after_configurator == _arch_before_configurator:
             model_size = _apply_model_size_preset(_post_config_model_size)
 
-# If SHIFT N/A is separated from padding/no-event, shifted mode needs one extra class:
+# If DOSE N/A is separated from padding/no-event, shifted mode needs one extra class:
 # 0=pad, 1=no-event, 2=dec, 3=maint, 4=inc, 5=na
-if separate_shift_na_from_padding and apply_token_shift and shift_vocab_size < 6:
-    shift_vocab_size = 6
+if separate_dose_na_from_padding and apply_token_shift and dose_vocab_size < 6:
+    dose_vocab_size = 6
 
-# Continuous SHIFT regression should not treat a numeric value as a special NA class token.
-if shift_continuous and separate_shift_na_from_padding:
-    separate_shift_na_from_padding = False
-    print("[fix] shift_continuous=True -> forcing separate_shift_na_from_padding=False")
+# Continuous DOSE regression should not treat a numeric value as a special NA class token.
+if dose_continuous and separate_dose_na_from_padding:
+    separate_dose_na_from_padding = False
+    print("[fix] dose_continuous=True -> forcing separate_dose_na_from_padding=False")
 
 config = {k: globals()[k] for k in config_keys}
 # -----------------------------------------------------------------------------
@@ -386,36 +388,36 @@ torch.set_default_dtype(ptdtype)
 
 # data_dir = '../data'
 
-def _compute_shift_class_weights(shift_values, shift_vocab_size, shift_ignore_index):
-    counts = np.bincount(shift_values, minlength=shift_vocab_size).astype(np.float64)
-    if shift_ignore_index is not None and 0 <= shift_ignore_index < shift_vocab_size:
-        counts[shift_ignore_index] = 0.0
+def _compute_dose_class_weights(dose_values, dose_vocab_size, dose_ignore_index):
+    counts = np.bincount(dose_values, minlength=dose_vocab_size).astype(np.float64)
+    if dose_ignore_index is not None and 0 <= dose_ignore_index < dose_vocab_size:
+        counts[dose_ignore_index] = 0.0
     nonzero = counts > 0
-    weights = np.zeros(shift_vocab_size, dtype=np.float32)
+    weights = np.zeros(dose_vocab_size, dtype=np.float32)
     if nonzero.any():
         weights[nonzero] = counts[nonzero].sum() / (counts[nonzero] * nonzero.sum())
-        cap = float(globals().get('shift_class_weight_cap', 8.0))
+        cap = float(globals().get('dose_class_weight_cap', 8.0))
         weights[nonzero] = np.clip(weights[nonzero], 1.0, cap)
     return weights.tolist()
 
 
-def _remap_shift_to_change_np(shift_values: np.ndarray, shifted: bool) -> np.ndarray:
+def _remap_dose_to_change_np(dose_values: np.ndarray, shifted: bool) -> np.ndarray:
     """
-    Remap SHIFT labels to binary change labels:
+    Remap DOSE labels to binary change labels:
     - changed(1): Dec/Inc
     - maintain(0): Maint
     """
-    out = np.full(shift_values.shape, -1, dtype=np.int64)
+    out = np.full(dose_values.shape, -1, dtype=np.int64)
     if shifted:
         # shifted labels: Dec=2, Maint=3, Inc=4
-        is_dec = shift_values == 2
-        is_maint = shift_values == 3
-        is_inc = shift_values == 4
+        is_dec = dose_values == 2
+        is_maint = dose_values == 3
+        is_inc = dose_values == 4
     else:
         # raw labels: Dec=1, Maint=2, Inc=3
-        is_dec = shift_values == 1
-        is_maint = shift_values == 2
-        is_inc = shift_values == 3
+        is_dec = dose_values == 1
+        is_maint = dose_values == 2
+        is_inc = dose_values == 3
     out[is_maint] = 0
     out[is_dec | is_inc] = 1
     return out
@@ -457,21 +459,21 @@ def _compute_label_scaling_stats(values: np.ndarray, strategy: str):
         raise ValueError(f"Unknown label_scaling strategy: {strategy}")
     return out
 
-# 6-column structured data: (ID, AGE, DATA, DOSE, TOTAL, UNIT)
+# 6-column structured data: (ID, AGE, DATA, DOSE, DURATION, UNIT)
 # composite_dtype = np.dtype([
 #     ('ID', '<u4'),
 #     ('AGE', '<u4'),
 #     ('DATA', '<u4'),
 #     ('DOSE', '<f4'),
-#     ('TOTAL', '<u4'),
+#     ('DURATION', '<u4'),
 #     ('UNIT', '<u4')
 # ])
 composite_dtype = np.dtype([
     ('ID', np.uint32),
     ('AGE', np.uint32),
     ('DATA', np.uint32),
-    ('SHIFT', np.float32),
-    ('TOTAL', np.uint32)
+    ('DOSE', np.float32),
+    ('DURATION', np.uint32)
 ])
 
 # train_data = np.memmap(TRAIN_DATA_PATH, dtype=composite_dtype, mode='r')
@@ -485,102 +487,102 @@ val_p2i = get_p2i_composite(val_data)
 if master_process:
     print(f"Loaded composite data: train={len(train_data)}, val={len(val_data)}")
     print(f"Unique patients: train={len(train_p2i)}, val={len(val_p2i)}")
-    print(f"SHIFT N/A separation: {separate_shift_na_from_padding} (shift_na_raw_token={shift_na_raw_token})")
+    print(f"DOSE N/A separation: {separate_dose_na_from_padding} (dose_na_raw_token={dose_na_raw_token})")
 
 # Drug token range (used by both class-weighting and patient sampling)
 drug_token_min = 1279 if apply_token_shift else 1278
 drug_token_max = 1289 if apply_token_shift else 1288
 
-# SHIFT continuous stats (used to set MDN range and input scaling)
-shift_stats = train_data['SHIFT'].astype(np.float32)
+# DOSE continuous stats (used to set MDN range and input scaling)
+dose_stats = train_data['DOSE'].astype(np.float32)
 if apply_token_shift:
-    shift_stats = shift_stats + 1.0
-shift_valid_stats = shift_stats >= 0
-if shift_continuous and separate_shift_na_from_padding and shift_exclude_na_token:
-    shift_na_token = float(shift_na_raw_token + (1 if apply_token_shift else 0))
-    shift_valid_stats &= shift_stats != shift_na_token
-shift_stats = shift_stats[shift_valid_stats]
-if shift_continuous and shift_stats.size > 0:
-    p_hi_ref = float(np.percentile(shift_stats, 99.5))
-    if shift_max_value > 0 and shift_max_value > max(10.0, p_hi_ref * 3.0):
+    dose_stats = dose_stats + 1.0
+dose_valid_stats = dose_stats >= 0
+if dose_continuous and separate_dose_na_from_padding and dose_exclude_na_token:
+    dose_na_token = float(dose_na_raw_token + (1 if apply_token_shift else 0))
+    dose_valid_stats &= dose_stats != dose_na_token
+dose_stats = dose_stats[dose_valid_stats]
+if dose_continuous and dose_stats.size > 0:
+    p_hi_ref = float(np.percentile(dose_stats, 99.5))
+    if dose_max_value > 0 and dose_max_value > max(10.0, p_hi_ref * 3.0):
         if master_process:
             print(
-                f"[warning] shift_max_value={shift_max_value:.4f} is much larger than "
-                f"SHIFT p99.5={p_hi_ref:.4f}. "
-                "This can weaken SHIFT gradients (especially drug-conditioned head). "
-                "Consider --shift_max_value=-1 (auto) or a tighter cap."
+                f"[warning] dose_max_value={dose_max_value:.4f} is much larger than "
+                f"DOSE p99.5={p_hi_ref:.4f}. "
+                "This can weaken DOSE gradients (especially drug-conditioned head). "
+                "Consider --dose_max_value=-1 (auto) or a tighter cap."
             )
-    if shift_max_value <= shift_min_value:
-        p_lo = float(np.percentile(shift_stats, shift_auto_min_percentile))
-        if float(shift_auto_max_percentile) >= 100.0:
-            p_hi = float(shift_stats.max())
+    if dose_max_value <= dose_min_value:
+        p_lo = float(np.percentile(dose_stats, dose_auto_min_percentile))
+        if float(dose_auto_max_percentile) >= 100.0:
+            p_hi = float(dose_stats.max())
         else:
-            p_hi = float(np.percentile(shift_stats, shift_auto_max_percentile))
+            p_hi = float(np.percentile(dose_stats, dose_auto_max_percentile))
         if p_hi <= p_lo:
-            p_lo = float(shift_stats.min())
-            p_hi = float(shift_stats.max())
-        shift_min_value = max(0.0, p_lo)
-        shift_max_value = max(shift_min_value + 1.0, p_hi)
+            p_lo = float(dose_stats.min())
+            p_hi = float(dose_stats.max())
+        dose_min_value = max(0.0, p_lo)
+        dose_max_value = max(dose_min_value + 1.0, p_hi)
         if master_process:
             print(
-                f"SHIFT auto-range: p{shift_auto_min_percentile}={p_lo:.4f}, "
-                f"p{shift_auto_max_percentile}={p_hi:.4f}, data_max={float(shift_stats.max()):.4f}"
+                f"DOSE auto-range: p{dose_auto_min_percentile}={p_lo:.4f}, "
+                f"p{dose_auto_max_percentile}={p_hi:.4f}, data_max={float(dose_stats.max()):.4f}"
             )
-    if shift_input_scale <= 0:
-        shift_scale_stats = shift_stats
-        if shift_log:
-            shift_scale_stats = np.log1p(np.clip(shift_scale_stats, a_min=0.0, a_max=None))
-        shift_input_scale = max(float(np.percentile(np.abs(shift_scale_stats), 95.0)), 1.0)
+    if dose_input_scale <= 0:
+        dose_scale_stats = dose_stats
+        if dose_log:
+            dose_scale_stats = np.log1p(np.clip(dose_scale_stats, a_min=0.0, a_max=None))
+        dose_input_scale = max(float(np.percentile(np.abs(dose_scale_stats), 95.0)), 1.0)
     if master_process:
         print(
-            f"SHIFT continuous mode: min={shift_min_value:.4f}, max={shift_max_value:.4f}, "
-            f"input_scale={shift_input_scale:.4f}, shift_log={shift_log}"
+            f"DOSE continuous mode: min={dose_min_value:.4f}, max={dose_max_value:.4f}, "
+            f"input_scale={dose_input_scale:.4f}, dose_log={dose_log}"
         )
 
-total_stats = train_data['TOTAL'].astype(np.float32)
-total_valid_stats = total_stats >= 0
-total_stats = total_stats[total_valid_stats]
+dur_stats = train_data['DURATION'].astype(np.float32)
+dur_valid_stats = dur_stats >= 0
+dur_stats = dur_stats[dur_valid_stats]
 
 label_scaling = str(label_scaling).lower()
-shift_scaling_stats = _compute_label_scaling_stats(shift_stats, label_scaling)
-total_scaling_stats = _compute_label_scaling_stats(total_stats, label_scaling)
+dose_scaling_stats = _compute_label_scaling_stats(dose_stats, label_scaling)
+dur_scaling_stats = _compute_label_scaling_stats(dur_stats, label_scaling)
 
 if master_process:
     print(
         f"Label scaling={label_scaling} | "
-        f"SHIFT(center={shift_scaling_stats['center']:.4f}, scale={shift_scaling_stats['scale']:.4f}, var={shift_scaling_stats['var']:.4f}) | "
-        f"TOTAL(center={total_scaling_stats['center']:.4f}, scale={total_scaling_stats['scale']:.4f}, var={total_scaling_stats['var']:.4f})"
+        f"DOSE(center={dose_scaling_stats['center']:.4f}, scale={dose_scaling_stats['scale']:.4f}, var={dose_scaling_stats['var']:.4f}) | "
+        f"DURATION(center={dur_scaling_stats['center']:.4f}, scale={dur_scaling_stats['scale']:.4f}, var={dur_scaling_stats['var']:.4f})"
     )
     if loss_normalize_by_variance:
         print(
-            f"Loss variance normalization enabled: shift_var={shift_scaling_stats['var']:.6f}, "
-            f"total_var={total_scaling_stats['var']:.6f}"
+            f"Loss variance normalization enabled: dose_var={dose_scaling_stats['var']:.6f}, "
+            f"dur_var={dur_scaling_stats['var']:.6f}"
         )
 
-# Dynamic Class Weighting (SHIFT, legacy discrete mode only)
-if not shift_continuous and not shift_class_weights:
+# Dynamic Class Weighting (DOSE, legacy discrete mode only)
+if not dose_continuous and not dose_class_weights:
     drug_mask = (train_data['DATA'] >= drug_token_min) & (train_data['DATA'] <= drug_token_max)
-    shift_values = train_data['SHIFT'][drug_mask].astype(np.int64)
+    dose_values = train_data['DOSE'][drug_mask].astype(np.int64)
     if apply_token_shift:
-        shift_values = shift_values + 1
-    shift_values = _remap_shift_to_change_np(shift_values, shifted=apply_token_shift)
-    shift_values = shift_values[shift_values >= 0]
-    shift_class_weights = _compute_shift_class_weights(
-        shift_values,
+        dose_values = dose_values + 1
+    dose_values = _remap_dose_to_change_np(dose_values, shifted=apply_token_shift)
+    dose_values = dose_values[dose_values >= 0]
+    dose_class_weights = _compute_dose_class_weights(
+        dose_values,
         change_vocab_size,
-        shift_ignore_index,
+        dose_ignore_index,
     )
     if master_process:
-        print(f"Computed binary change class weights (drug-token subset): {shift_class_weights}")
-elif shift_continuous:
-    shift_class_weights = []
+        print(f"Computed binary change class weights (drug-token subset): {dose_class_weights}")
+elif dose_continuous:
+    dose_class_weights = []
     if master_process:
-        print("SHIFT continuous mode: skipping binary class-weight computation.")
+        print("DOSE continuous mode: skipping binary class-weight computation.")
 
 # WeightedRandomSampler: Patient-level sampling
 if master_process:
-    if shift_continuous:
-        print("Computing patient-level sampling weights for continuous SHIFT signal...")
+    if dose_continuous:
+        print("Computing patient-level sampling weights for continuous DOSE signal...")
     else:
         print("Computing patient-level sampling weights for binary-change balancing...")
 
@@ -588,17 +590,17 @@ patient_weights = np.zeros(len(train_p2i), dtype=np.float32)
 for pid, (start_idx, length) in enumerate(train_p2i):
     patient_data = train_data[start_idx:start_idx + length]
     drug_mask = (patient_data['DATA'] >= drug_token_min) & (patient_data['DATA'] <= drug_token_max)
-    patient_shifts = patient_data['SHIFT'][drug_mask].astype(np.float32)
+    patient_doses = patient_data['DOSE'][drug_mask].astype(np.float32)
     if apply_token_shift:
-        patient_shifts = patient_shifts + 1.0
-    if shift_continuous:
-        if separate_shift_na_from_padding and shift_exclude_na_token:
-            na_token = float(shift_na_raw_token + (1 if apply_token_shift else 0))
-            patient_shifts = patient_shifts[patient_shifts != na_token]
-        signal_count = (patient_shifts > 0).sum()
+        patient_doses = patient_doses + 1.0
+    if dose_continuous:
+        if separate_dose_na_from_padding and dose_exclude_na_token:
+            na_token = float(dose_na_raw_token + (1 if apply_token_shift else 0))
+            patient_doses = patient_doses[patient_doses != na_token]
+        signal_count = (patient_doses > 0).sum()
         patient_weights[pid] = 1.0 + signal_count * 0.05
     else:
-        patient_changes = _remap_shift_to_change_np(patient_shifts.astype(np.int64), shifted=apply_token_shift)
+        patient_changes = _remap_dose_to_change_np(patient_doses.astype(np.int64), shifted=apply_token_shift)
         minority_count = (patient_changes == 1).sum()
         patient_weights[pid] = 1.0 + minority_count * 0.3
 
@@ -607,10 +609,10 @@ patient_weights_tensor = torch.from_numpy(patient_weights)
 
 minority_patient_count = (patient_weights > 1.0 / len(train_p2i)).sum()
 if master_process:
-    if shift_continuous:
-        print(f"  Patients with non-zero SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+    if dose_continuous:
+        print(f"  Patients with non-zero DOSE events: {minority_patient_count:,} / {len(train_p2i):,}")
     else:
-        print(f"  Patients with changed SHIFT events: {minority_patient_count:,} / {len(train_p2i):,}")
+        print(f"  Patients with changed DOSE events: {minority_patient_count:,} / {len(train_p2i):,}")
     print(f"  Max sampling weight: {patient_weights.max():.4f}, Min: {patient_weights.min():.6f}")
 
 # Downsample to requested fraction
@@ -648,48 +650,50 @@ model_args = dict(
     drug_token_min=drug_token_min,
     drug_token_max=drug_token_max,
     mdn_n_components=mdn_n_components,
-    shift_min_value=shift_min_value,
-    shift_max_value=shift_max_value,
-    shift_continuous=shift_continuous,
-    shift_log=shift_log,
-    shift_input_scale=shift_input_scale,
-    shift_exclude_na_token=shift_exclude_na_token,
-    shift_mdn_nll_weight=shift_mdn_nll_weight,
-    shift_label_scaling=label_scaling,
-    shift_label_center=shift_scaling_stats['center'],
-    shift_label_scale=shift_scaling_stats['scale'],
-    shift_label_min=shift_scaling_stats['min'],
-    shift_label_max=shift_scaling_stats['max'],
-    total_min_value=total_min_value,
-    total_max_value=total_max_value,
-    total_log_transform=total_log_transform,
-    total_label_scaling=label_scaling,
-    total_label_center=total_scaling_stats['center'],
-    total_label_scale=total_scaling_stats['scale'],
-    total_label_min=total_scaling_stats['min'],
-    total_label_max=total_scaling_stats['max'],
+    dose_min_value=dose_min_value,
+    dose_max_value=dose_max_value,
+    dose_continuous=dose_continuous,
+    dose_log=dose_log,
+    dose_input_scale=dose_input_scale,
+    dose_exclude_na_token=dose_exclude_na_token,
+    dose_mdn_nll_weight=dose_mdn_nll_weight,
+    dose_label_scaling=label_scaling,
+    dose_label_center=dose_scaling_stats['center'],
+    dose_label_scale=dose_scaling_stats['scale'],
+    dose_label_min=dose_scaling_stats['min'],
+    dose_label_max=dose_scaling_stats['max'],
+    dur_min_value=dur_min_value,
+    dur_max_value=dur_max_value,
+    dur_log_transform=dur_log_transform,
+    dur_label_scaling=label_scaling,
+    dur_label_center=dur_scaling_stats['center'],
+    dur_label_scale=dur_scaling_stats['scale'],
+    dur_label_min=dur_scaling_stats['min'],
+    dur_label_max=dur_scaling_stats['max'],
+    drug_token_only_regression=drug_token_only_regression,
+    drug_token_loss_weight=drug_token_loss_weight,
     loss_normalize_by_variance=loss_normalize_by_variance,
-    shift_loss_variance=shift_scaling_stats['var'],
-    total_loss_variance=total_scaling_stats['var'],
+    dose_loss_variance=dose_scaling_stats['var'],
+    dur_loss_variance=dur_scaling_stats['var'],
     # Composite-specific
     data_vocab_size=data_vocab_size,
-    shift_vocab_size=shift_vocab_size,
-    total_vocab_size=total_vocab_size,
-    # SHIFT loss options
-    shift_loss_type=shift_loss_type,
-    shift_dice_weight=shift_dice_weight,
-    shift_ignore_index=shift_ignore_index,
-    shift_maintain_idx=shift_maintain_idx,
-    shift_change_weight_max=shift_change_weight_max,
-    shift_focal_gamma=shift_focal_gamma,
-    shift_class_weights=shift_class_weights,
+    dose_vocab_size=dose_vocab_size,
+    dur_vocab_size=dur_vocab_size,
+    # DOSE loss options
+    dose_loss_type=dose_loss_type,
+    dose_dice_weight=dose_dice_weight,
+    dose_ignore_index=dose_ignore_index,
+    dose_maintain_idx=dose_maintain_idx,
+    dose_change_weight_max=dose_change_weight_max,
+    dose_focal_gamma=dose_focal_gamma,
+    dose_class_weights=dose_class_weights,
     apply_token_shift=apply_token_shift,
-    separate_shift_na_from_padding=separate_shift_na_from_padding,
-    shift_na_raw_token=shift_na_raw_token,
+    separate_dose_na_from_padding=separate_dose_na_from_padding,
+    dose_na_raw_token=dose_na_raw_token,
     loss_weight_data=loss_weight_data,
-    loss_weight_shift=loss_weight_shift,
+    loss_weight_dose=loss_weight_dose,
     loss_weight_change=loss_weight_change,
-    loss_weight_total=loss_weight_total,
+    loss_weight_durationation=loss_weight_durationation,
     loss_weight_time=loss_weight_time,
     # Time-to-Event distribution
     time_distribution=time_distribution,
@@ -707,22 +711,22 @@ elif init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     for k in ['n_layer', 'n_head', 'n_kv_head', 'n_embd', 'block_size', 'bias',
-              'data_vocab_size', 'shift_vocab_size', 'total_vocab_size',
-              'shift_min_value', 'shift_max_value', 'shift_continuous',
-              'shift_log', 'shift_input_scale', 'shift_exclude_na_token', 'shift_mdn_nll_weight',
-              'shift_label_scaling', 'shift_label_center', 'shift_label_scale', 'shift_label_min', 'shift_label_max',
-              'total_label_scaling', 'total_label_center', 'total_label_scale', 'total_label_min', 'total_label_max',
-              'loss_normalize_by_variance', 'shift_loss_variance', 'total_loss_variance']:
+              'data_vocab_size', 'dose_vocab_size', 'dur_vocab_size',
+              'dose_min_value', 'dose_max_value', 'dose_continuous',
+              'dose_log', 'dose_input_scale', 'dose_exclude_na_token', 'dose_mdn_nll_weight',
+              'dose_label_scaling', 'dose_label_center', 'dose_label_scale', 'dose_label_min', 'dose_label_max',
+              'dur_label_scaling', 'dur_label_center', 'dur_label_scale', 'dur_label_min', 'dur_label_max',
+              'loss_normalize_by_variance', 'dose_loss_variance', 'dur_loss_variance']:
         if k in checkpoint_model_args:
             model_args[k] = checkpoint_model_args[k]
-    if 'shift_log' not in checkpoint_model_args:
-        model_args['shift_log'] = False
-    if 'shift_continuous' not in checkpoint_model_args:
-        model_args['shift_continuous'] = False
-        model_args['shift_log'] = False
-        model_args['shift_input_scale'] = 1.0
-        model_args['shift_exclude_na_token'] = True
-        model_args['shift_mdn_nll_weight'] = 0.0
+    if 'dose_log' not in checkpoint_model_args:
+        model_args['dose_log'] = False
+    if 'dose_continuous' not in checkpoint_model_args:
+        model_args['dose_continuous'] = False
+        model_args['dose_log'] = False
+        model_args['dose_input_scale'] = 1.0
+        model_args['dose_exclude_na_token'] = True
+        model_args['dose_mdn_nll_weight'] = 0.0
     gptconf = CompositeDelphiConfig(**model_args)
     model = CompositeDelphi(gptconf)
     state_dict = checkpoint['model']
@@ -779,7 +783,7 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters, 6)  # loss, data, shift, change, total, time
+        losses = torch.zeros(eval_iters, 6)  # loss, data, dose, change, duration, time
         data = train_data if split == 'train' else val_data
         p2i = train_p2i if split == 'train' else val_p2i
         for k in range(eval_iters):
@@ -789,9 +793,9 @@ def estimate_loss():
                                         no_event_token_rate=no_event_token_rate,
                                         cut_batch=True,
                                         apply_token_shift=apply_token_shift,
-                                        shift_continuous=shift_continuous,
-                                        separate_shift_na_from_padding=separate_shift_na_from_padding,
-                                        shift_na_raw_token=shift_na_raw_token)
+                                        dose_continuous=dose_continuous,
+                                        separate_dose_na_from_padding=separate_dose_na_from_padding,
+                                        dose_na_raw_token=dose_na_raw_token)
             x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
             
             with ctx:
@@ -803,9 +807,9 @@ def estimate_loss():
             losses[k] = torch.stack([
                 loss['loss'],
                 loss['loss_data'],
-                loss['loss_shift'],
+                loss['loss_dose'],
                 loss['loss_change'],
-                loss['loss_total'],
+                loss['loss_dur'],
                 loss['loss_time']
             ])
         out[split] = losses.mean(0)
@@ -891,15 +895,15 @@ if master_process:
     print(f"  Validation interval: every {eval_interval} iterations")
     print(f"{'='*60}\n")
 
-# Initial batch (weighted sampling for SHIFT class balance)
+# Initial batch (weighted sampling for DOSE class balance)
 ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
 batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                             padding='random', lifestyle_augmentations=True, select='left',
                             no_event_token_rate=no_event_token_rate,
                             apply_token_shift=apply_token_shift,
-                            shift_continuous=shift_continuous,
-                            separate_shift_na_from_padding=separate_shift_na_from_padding,
-                            shift_na_raw_token=shift_na_raw_token)
+                            dose_continuous=dose_continuous,
+                            separate_dose_na_from_padding=separate_dose_na_from_padding,
+                            dose_na_raw_token=dose_na_raw_token)
 x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
 
 t0 = time.time()
@@ -933,8 +937,8 @@ while True:
             print(
                 "  breakdown (train/val) - "
                 f"data: {train_breakdown[1].item():.4f}/{val_breakdown[1].item():.4f}, "
-                f"shift: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
-                f"total: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}, "
+                f"dose: {train_breakdown[2].item():.4f}/{val_breakdown[2].item():.4f}, "
+                f"dur: {train_breakdown[4].item():.4f}/{val_breakdown[4].item():.4f}, "
                 f"time: {train_breakdown[5].item():.4f}/{val_breakdown[5].item():.4f}"
             )
             val_loss_steps.append(iter_num)
@@ -946,8 +950,8 @@ while True:
                     "train/loss": losses['train'][0].item(),
                     "val/loss": val_loss,
                     "val/loss_data": val_loss_unpooled[1].item(),
-                    "val/loss_shift": val_loss_unpooled[2].item(),
-                    "val/loss_total": val_loss_unpooled[4].item(),
+                    "val/loss_dose": val_loss_unpooled[2].item(),
+                    "val/loss_dur": val_loss_unpooled[4].item(),
                     "val/loss_time": val_loss_unpooled[5].item(),
                 })
 
@@ -1021,19 +1025,19 @@ while True:
                 y_data, y_shift, y_total, y_ages
             )
 
-        # Prefetch next batch (weighted sampling for SHIFT class balance)
+        # Prefetch next batch (weighted sampling for DOSE class balance)
         ix = torch.multinomial(patient_weights_tensor, batch_size, replacement=True)
         batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, device=device,
                                     padding='random', lifestyle_augmentations=True, select='left',
                                     no_event_token_rate=no_event_token_rate, cut_batch=True,
                                     apply_token_shift=apply_token_shift,
-                                    shift_continuous=shift_continuous,
-                                    separate_shift_na_from_padding=separate_shift_na_from_padding,
-                                    shift_na_raw_token=shift_na_raw_token)
+                                    dose_continuous=dose_continuous,
+                                    separate_dose_na_from_padding=separate_dose_na_from_padding,
+                                    dose_na_raw_token=dose_na_raw_token)
         x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
-        total_loss = loss['loss']
+        dur_loss = loss['loss']
 
-        scaler.scale(total_loss).backward()
+        scaler.scale(dur_loss).backward()
 
     # Gradient clipping
     if grad_clip != 0.0:
@@ -1051,7 +1055,7 @@ while True:
     t0 = t1
     
     if master_process and iter_num % log_interval == 0:
-        lossf = total_loss.item()
+        lossf = dur_loss.item()
         train_loss_steps.append(iter_num)
         train_loss_history.append(lossf)
         valf = f"{val_loss:.4f}" if val_loss is not None else "n/a"
@@ -1066,10 +1070,10 @@ while True:
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
-                "train/loss": total_loss.item(),
+                "train/loss": dur_loss.item(),
                 "train/loss_data": loss['loss_data'].item(),
-                "train/loss_shift": loss['loss_shift'].item(),
-                "train/loss_total": loss['loss_total'].item(),
+                "train/loss_dose": loss['loss_dose'].item(),
+                "train/loss_dur": loss['loss_dur'].item(),
                 "train/loss_time": loss['loss_time'].item(),
                 "lr": lr,
             })

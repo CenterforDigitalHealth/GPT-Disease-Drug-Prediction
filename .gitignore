@@ -16,6 +16,8 @@ ablation/**/train_out/
 ablation/**/logs/
 wandb/
 prev_model_ver/
+out_dann/
+*_dann.py
 
 sampling_trajectories_.ipynb
 sampling_trajectories_v6.ipynb
