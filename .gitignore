@@ -17,6 +17,8 @@ ablation/**/logs/
 wandb/
 prev_model_ver/
 out_dann/
+0319_1839_out/
+0319_2059_out/
 *_dann.py
 
 sampling_trajectories_.ipynb

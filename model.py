@@ -702,7 +702,7 @@ class MultiHeadOutput(nn.Module):
             # Provisional identity init here; reapplied after parent model init.
             self.reset_film_identity()
         
-        # v6 (Delphi-style): DATA logits are shared for event type and time-to-event.
+        # Delphi-style: DATA logits are shared for event type and time-to-event.
         # Keep only optional Weibull shape head.
         
         # Weibull shape parameter (k) - 전역 또는 per-event
@@ -810,7 +810,7 @@ class MultiHeadOutput(nn.Module):
                 output['dur_drug_cond'] = dur_drug_cond
                 output['dur_mdn_drug_cond'] = dur_drug_mdn
         
-        # v6 keeps Delphi semantics: time scale uses DATA logits.
+        # Delphi semantics: time scale uses DATA logits.
         # Expose aliases for compatibility with existing tooling.
         output['time_scale'] = output['data']
         output['time'] = output['time_scale']
@@ -916,7 +916,7 @@ class CompositeDelphiConfig:
     loss_weight_dose: float = 20.0
     # No separate auxiliary change head in legacy versions.
     loss_weight_change: float = 0.0
-    loss_weight_total: float = 5.0
+    loss_weight_duration: float = 5.0
     loss_weight_time: float = 1.0
 
     # Kept for compatibility (unused in legacy DOSE regression)
@@ -1386,7 +1386,7 @@ class CompositeDelphi(nn.Module):
             log_lambda_i = time_logits - F.softplus(time_logits + log_t_min)  # (B, T, V)
 
             # Competing-risk aggregate rate:
-            # lambda_total = sum_i p_i * lambda_i
+            # lambda_duration = sum_i p_i * lambda_i
             event_log_probs = F.log_softmax(time_logits, dim=-1)
             log_lambda = torch.logsumexp(event_log_probs + log_lambda_i, dim=-1)  # (B, T)
             log_lambda = torch.clamp(log_lambda, min=-20.0, max=20.0)
@@ -1444,22 +1444,22 @@ class CompositeDelphi(nn.Module):
             loss_dur = loss_dur * drug_loss_weight
 
         # Weighted sum of losses
-        total_loss = (
+        duration_loss = (
             self.config.loss_weight_data * loss_data +
             self.config.loss_weight_dose * loss_dose +
             self.config.loss_weight_change * loss_change +
-            self.config.loss_weight_total * loss_dur +
+            self.config.loss_weight_duration * loss_dur +
             self.config.loss_weight_time * loss_time
         )
         
         # MoE load balancing loss (α=0.01)
-        loss_moe = torch.tensor(0.0, device=total_loss.device)
+        loss_moe = torch.tensor(0.0, device=duration_loss.device)
         if moe_aux_loss is not None:
             loss_moe = moe_aux_loss
-            total_loss = total_loss + 0.01 * loss_moe
+            duration_loss = duration_loss + 0.01 * loss_moe
         
         return {
-            'loss': total_loss,
+            'loss': duration_loss,
             'loss_data': loss_data,
             'loss_dose': loss_dose,
             'loss_change': loss_change,

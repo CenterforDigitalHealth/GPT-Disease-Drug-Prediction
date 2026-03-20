@@ -5,13 +5,16 @@ import re
 def get_batch_composite(ix, data, p2i, select='center', index='patient', padding='regular',
                         block_size=48, device='cpu', lifestyle_augmentations=False,
                         no_event_token_rate=5, cut_batch=False, apply_token_shift=True,
-                        shift_continuous=False, separate_shift_na_from_padding=False, shift_na_raw_token=4):
+                        shift_continuous=False, separate_shift_na_from_padding=False, shift_na_raw_token=4,
+                        dose_continuous=None, separate_dose_na_from_padding=None, dose_na_raw_token=None):
     """
-    Get a batch of composite data (DATA, SHIFT, TOTAL) from the dataset.
+    Get a batch of composite data (DATA, DOSE/SHIFT, DURATION/TOTAL) from the dataset.
     
     Args:
         ix: list of indices to get data from
-        data: structured numpy array with fields (ID, AGE, DATA, SHIFT, TOTAL)
+        data: structured numpy array with fields:
+            - modern: (ID, AGE, DATA, DOSE, DURATION)
+            - legacy: (ID, AGE, DATA, SHIFT, TOTAL)
         p2i: numpy array of the patient to index mapping
         select: 'left', 'right', 'random'
         index: 'patient', 'random'
@@ -22,12 +25,12 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         no_event_token_rate: average rate of "no event" tokens in years
         cut_batch: whether to cut the batch to the smallest size possible
         apply_token_shift: whether to shift tokens by +1 to reserve 0 for padding
-        shift_continuous: whether SHIFT is continuous regression target
-        separate_shift_na_from_padding: when True, remap raw SHIFT==0 (N/A) to
-            shift_na_raw_token before synthetic no-event insertion. This keeps
-            no-event/padding(0) distinct from real N/A in SHIFT.
-        shift_na_raw_token: raw SHIFT token id used for N/A remapping when
-            separate_shift_na_from_padding=True (default: 4)
+        shift_continuous: legacy name for whether DOSE/SHIFT is continuous
+        separate_shift_na_from_padding: legacy name for DOSE/SHIFT N/A remapping
+        shift_na_raw_token: legacy name for DOSE/SHIFT N/A token id
+        dose_continuous: alias of shift_continuous (preferred name)
+        separate_dose_na_from_padding: alias of separate_shift_na_from_padding
+        dose_na_raw_token: alias of shift_na_raw_token
 
     Returns:
         x_data: input DATA tokens (B, T)
@@ -39,6 +42,19 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
         y_total: target TOTAL values (B, T)
         y_ages: target ages (B, T)
     """
+    # Backward-compatible argument aliases (preferred: dose_* names).
+    if dose_continuous is not None:
+        shift_continuous = bool(dose_continuous)
+    if separate_dose_na_from_padding is not None:
+        separate_shift_na_from_padding = bool(separate_dose_na_from_padding)
+    if dose_na_raw_token is not None:
+        shift_na_raw_token = int(dose_na_raw_token)
+
+    # Backward-compatible field aliases (preferred: DOSE/DURATION).
+    field_names = set(data.dtype.names)
+    dose_field = 'DOSE' if 'DOSE' in field_names else 'SHIFT'
+    dur_field = 'DURATION' if 'DURATION' in field_names else 'TOTAL'
+
     mask_time = -10000.
 
     x = torch.tensor(np.array([p2i[int(i)] for i in ix]))
@@ -72,10 +88,10 @@ def get_batch_composite(ix, data, p2i, select='center', index='patient', padding
     # Extract all fields
     data_tokens = torch.from_numpy(data['DATA'][batch_idx].astype(np.int64))
     if shift_continuous:
-        shift_values = torch.from_numpy(data['SHIFT'][batch_idx].astype(np.float32))
+        shift_values = torch.from_numpy(data[dose_field][batch_idx].astype(np.float32))
     else:
-        shift_values = torch.from_numpy(data['SHIFT'][batch_idx].astype(np.int64))
-    total_values = torch.from_numpy(data['TOTAL'][batch_idx].astype(np.int64))
+        shift_values = torch.from_numpy(data[dose_field][batch_idx].astype(np.int64))
+    total_values = torch.from_numpy(data[dur_field][batch_idx].astype(np.int64))
     ages = torch.from_numpy(data['AGE'][batch_idx].astype(np.float32))
 
     # Mask invalid data

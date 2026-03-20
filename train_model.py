@@ -122,8 +122,8 @@ from utils import get_p2i_composite, get_batch_composite
 # Default Configuration
 # =============================================================================
 
-out_dir = 'out_v6'
-out_dir_use_timestamp = True  # when out_dir=='out_v6' and scratch, save to MMDD_HHMM_out_v6
+out_dir = 'out'
+out_dir_use_timestamp = True  # when out_dir=='out' and scratch, save to MMDD_HHMM_out
 eval_interval = 100
 log_interval = 100
 eval_iters = 100
@@ -170,7 +170,7 @@ dur_vocab_size = 552   # DURATION: Embedding vocab
 
 # DOSE continuous regression settings
 dose_continuous = True
-dose_log = False                # if True: train DOSE head on log1p(target) in continuous mode
+dose_log = True                # if True: train DOSE head on log1p(target) in continuous mode
 dose_input_scale = -1.0         # <=0: auto from train data
 dose_min_value = 0.0
 dose_max_value = -1.0           # <=0: auto from train data percentile
@@ -201,7 +201,7 @@ dur_max_value = 550.0
 loss_weight_data = 1.0
 loss_weight_dose = 20.0
 loss_weight_change = 0.0
-loss_weight_durationation = 5.0
+loss_weight_duration = 5.0
 loss_weight_time = 1.0
 
 # architecture features
@@ -212,12 +212,12 @@ sliding_window = 128
 
 # Drug-conditioning
 use_drug_conditioning = True
-drug_token_only_regression = False
+drug_token_only_regression = True
 drug_token_loss_weight = 1.0
 rope_theta = 10000.0
 
 # DURATION regression (legacy fallback only; MDN path does not use this)
-dur_log_transform = False
+dur_log_transform = True
 
 # adamw optimizer
 learning_rate = 6e-4
@@ -261,7 +261,7 @@ time_distribution = 'exponential'
 TRAIN_DATA_PATH = '../data/dose/kr_train.bin'
 VAL_DATA_PATH = '../data/dose/kr_val.bin'
 # JMDC path for domain generalization (mixing)
-JMDC_DATA_PATH = '../data/dose/JMDC_exval2.bin'
+JMDC_DATA_PATH = '../data/dose/JMDC_extval.bin'
 
 # -----------------------------------------------------------------------------
 config_keys = [k for k, v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, list))]
@@ -329,22 +329,15 @@ else:
         print("Using CPU")
 
 # Resolve final checkpoint directory
-# - v6 default behavior: out_v6 -> MMDD_HHMM_out_v6 for scratch runs
-# - compatibility: normalize legacy out_v6_cont -> out_v6
+# When out_dir=='out' and scratch, save to MMDD_HHMM_out
 out_dir_norm = os.path.normpath(out_dir)
 out_dir_parent = os.path.dirname(out_dir_norm)
 out_dir_base = os.path.basename(out_dir_norm)
-if out_dir_base == 'out_v6_cont':
-    out_dir_base = 'out_v6'
-    out_dir_norm = os.path.join(out_dir_parent, out_dir_base) if out_dir_parent else out_dir_base
-    out_dir = out_dir_norm
-    if master_process:
-        print("[path] normalized out_dir from 'out_v6_cont' to 'out_v6'")
 
 if (
     init_from == 'scratch'
     and out_dir_use_timestamp
-    and out_dir_base == 'out_v6'
+    and out_dir_base == 'out'
 ):
     run_timestamp = os.environ.get('TRAIN_RUN_TIMESTAMP')
     if run_timestamp is None:
@@ -693,7 +686,7 @@ model_args = dict(
     loss_weight_data=loss_weight_data,
     loss_weight_dose=loss_weight_dose,
     loss_weight_change=loss_weight_change,
-    loss_weight_durationation=loss_weight_durationation,
+    loss_weight_duration=loss_weight_duration,
     loss_weight_time=loss_weight_time,
     # Time-to-Event distribution
     time_distribution=time_distribution,
@@ -796,12 +789,12 @@ def estimate_loss():
                                         dose_continuous=dose_continuous,
                                         separate_dose_na_from_padding=separate_dose_na_from_padding,
                                         dose_na_raw_token=dose_na_raw_token)
-            x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
+            x_data, x_shift, x_dur, x_ages, y_data, y_shift, y_dur, y_ages = batch
             
             with ctx:
                 logits, loss, _ = model(
-                    x_data, x_shift, x_total, x_ages,
-                    y_data, y_shift, y_total, y_ages,
+                    x_data, x_shift, x_dur, x_ages,
+                    y_data, y_shift, y_dur, y_ages,
                     validation_loss_mode=True
                 )
             losses[k] = torch.stack([
@@ -904,7 +897,7 @@ batch = get_batch_composite(ix, train_data, train_p2i, block_size=block_size, de
                             dose_continuous=dose_continuous,
                             separate_dose_na_from_padding=separate_dose_na_from_padding,
                             dose_na_raw_token=dose_na_raw_token)
-x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
+x_data, x_shift, x_dur, x_ages, y_data, y_shift, y_dur, y_ages = batch
 
 t0 = time.time()
 local_iter_num = 0
@@ -1021,8 +1014,8 @@ while True:
 
         with ctx:
             logits, loss, att = model(
-                x_data, x_shift, x_total, x_ages,
-                y_data, y_shift, y_total, y_ages
+                x_data, x_shift, x_dur, x_ages,
+                y_data, y_shift, y_dur, y_ages
             )
 
         # Prefetch next batch (weighted sampling for DOSE class balance)
@@ -1034,7 +1027,7 @@ while True:
                                     dose_continuous=dose_continuous,
                                     separate_dose_na_from_padding=separate_dose_na_from_padding,
                                     dose_na_raw_token=dose_na_raw_token)
-        x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages = batch
+        x_data, x_shift, x_dur, x_ages, y_data, y_shift, y_dur, y_ages = batch
         dur_loss = loss['loss']
 
         scaler.scale(dur_loss).backward()

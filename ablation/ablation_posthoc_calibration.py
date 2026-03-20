@@ -3,7 +3,7 @@
 Ablation runner for post-hoc calibration only.
 
 - Evaluation only (no training): uses a pre-trained checkpoint
-- Screens posthoc_calibration: none, affine
+- Screens posthoc_calibration: none, affine, isotonic
 
 Per trial artifacts:
   - eval logs
@@ -50,7 +50,7 @@ def main() -> None:
     parser.add_argument(
         "--posthoc_calibrations",
         type=str,
-        default="none,affine",
+        default="none,affine,isotonic",
         help="Comma-separated calibration methods to screen",
     )
     parser.add_argument("--dataset_subset_size", type=int, default=10000, help="Eval subset size")
@@ -75,7 +75,7 @@ def main() -> None:
 
     # ---- Validate ----
     calibrations = parse_list(args.posthoc_calibrations)
-    bad = [x for x in calibrations if x not in {"none", "affine"}]
+    bad = [x for x in calibrations if x not in {"none", "affine", "isotonic"}]
     if bad:
         raise ValueError(f"Unknown calibration methods: {bad}")
     if args.resume_from_trial_id <= 0:

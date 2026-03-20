@@ -24,6 +24,7 @@ from sklearn.metrics import (
     r2_score,
     confusion_matrix
 )
+from sklearn.isotonic import IsotonicRegression
 
 def auc(x1, x2):
     n1 = len(x1)
@@ -107,6 +108,84 @@ def fit_affine_calibration(pred: np.ndarray, target: np.ndarray):
 
 def apply_affine_calibration(pred: np.ndarray, a: float, b: float):
     return a * np.asarray(pred, dtype=np.float64) + b
+
+
+def fit_isotonic_calibration(pred: np.ndarray, target: np.ndarray):
+    """Fit monotonic isotonic calibration map y ~= f(pred)."""
+    pred = np.asarray(pred, dtype=np.float64)
+    target = np.asarray(target, dtype=np.float64)
+    if pred.size == 0 or target.size == 0:
+        return None
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(pred, target)
+    return iso
+
+
+def apply_isotonic_calibration(pred: np.ndarray, iso_model):
+    pred = np.asarray(pred, dtype=np.float64)
+    if iso_model is None:
+        return pred
+    return iso_model.predict(pred)
+
+
+def fit_posthoc_calibration_bundle(
+    method: str,
+    *,
+    dose_pred: np.ndarray,
+    dose_target: np.ndarray,
+    dur_pred: np.ndarray,
+    dur_target: np.ndarray,
+    fit_source: str = "",
+):
+    """Fit calibration params/models for DOSE and DURATION."""
+    method = str(method).lower()
+    bundle = {
+        "method": method,
+        "fit_source": str(fit_source),
+        "dose": None,
+        "dur": None,
+    }
+    if method == "none":
+        return bundle
+    if method == "affine":
+        if dose_pred.size > 0 and dose_target.size > 0:
+            a_dose, b_dose = fit_affine_calibration(dose_pred, dose_target)
+            bundle["dose"] = {"a": float(a_dose), "b": float(b_dose)}
+        if dur_pred.size > 0 and dur_target.size > 0:
+            a_dur, b_dur = fit_affine_calibration(dur_pred, dur_target)
+            bundle["dur"] = {"a": float(a_dur), "b": float(b_dur)}
+        return bundle
+    if method == "isotonic":
+        if dose_pred.size > 0 and dose_target.size > 0:
+            iso_dose = fit_isotonic_calibration(dose_pred, dose_target)
+            bundle["dose"] = {
+                "model": iso_dose,
+                "n_knots": int(len(getattr(iso_dose, "X_thresholds_", []))) if iso_dose is not None else 0,
+            }
+        if dur_pred.size > 0 and dur_target.size > 0:
+            iso_dur = fit_isotonic_calibration(dur_pred, dur_target)
+            bundle["dur"] = {
+                "model": iso_dur,
+                "n_knots": int(len(getattr(iso_dur, "X_thresholds_", []))) if iso_dur is not None else 0,
+            }
+        return bundle
+    raise ValueError(f"Unknown posthoc calibration method: {method}")
+
+
+def apply_posthoc_calibration_bundle(pred: np.ndarray, bundle: dict, head: str) -> np.ndarray:
+    """Apply pre-fit calibration bundle to one head ('dose' or 'dur')."""
+    if not bundle:
+        return np.asarray(pred, dtype=np.float64)
+    method = str(bundle.get("method", "none")).lower()
+    head_obj = bundle.get(head, None)
+    pred = np.asarray(pred, dtype=np.float64)
+    if method == "none" or head_obj is None:
+        return pred
+    if method == "affine":
+        return apply_affine_calibration(pred, float(head_obj["a"]), float(head_obj["b"]))
+    if method == "isotonic":
+        return apply_isotonic_calibration(pred, head_obj.get("model", None))
+    raise ValueError(f"Unknown posthoc calibration method: {method}")
 
 
 def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
@@ -431,9 +510,19 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
     return out
 
 
-def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc_calibration='none'):
+def evaluate_composite_fields(
+    model,
+    d100k,
+    batch_size=64,
+    device="mps",
+    posthoc_calibration='none',
+    calibration_bundle=None,
+    fit_calibration=False,
+    calibration_fit_source='',
+    return_calibration_bundle=False,
+):
     """
-    Evaluate DOSE, DURATION predictions for CompositeDelphi v6 model.
+    Evaluate DOSE, DURATION predictions for CompositeDelphi model.
     
     Args:
         model: CompositeDelphi model
@@ -510,9 +599,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
                 targets_age=y_ages[start_idx:end_idx].to(device)
             )[0]  # Get logits dict
             
-            # v6:
-            # - DOSE: regression output (B, T)
-            # - DURATION: regression output (B, T)
+            # DOSE: regression output (B, T)
+            # DURATION: regression output (B, T)
             dose_pred = outputs['dose']
             dur_pred = outputs['duration']
 
@@ -635,6 +723,24 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
         all_targets_dur = np.array([])
 
     posthoc_calibration = str(posthoc_calibration).lower()
+    if posthoc_calibration not in {"none", "affine", "isotonic"}:
+        raise ValueError(f"Unknown posthoc_calibration: {posthoc_calibration}")
+
+    active_calibration_bundle = calibration_bundle
+    if active_calibration_bundle is None and posthoc_calibration in {"affine", "isotonic"}:
+        # Backward-compatible default: self-fit on current split unless an external bundle is supplied.
+        active_calibration_bundle = fit_posthoc_calibration_bundle(
+            posthoc_calibration,
+            dose_pred=all_predictions_dose.astype(np.float32),
+            dose_target=all_targets_dose.astype(np.float32),
+            dur_pred=all_predictions_dur.astype(np.float32),
+            dur_target=all_targets_dur.astype(np.float32),
+            fit_source=calibration_fit_source or "self",
+        )
+
+    active_calibration_method = "none"
+    if active_calibration_bundle is not None:
+        active_calibration_method = str(active_calibration_bundle.get("method", "none")).lower()
 
     # Calculate metrics (drug-token only)
     results = {}
@@ -656,15 +762,26 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
         results['dose_mean_pred'] = float(np.mean(dose_pred))
         results['dose_support'] = int(len(dose_target))
 
-        if posthoc_calibration == 'affine':
-            a_dose, b_dose = fit_affine_calibration(dose_pred, dose_target)
-            dose_pred_cal = apply_affine_calibration(dose_pred, a_dose, b_dose)
-            results['dose_calibration'] = 'affine'
-            results['dose_calibration_a'] = float(a_dose)
-            results['dose_calibration_b'] = float(b_dose)
-            results['dose_mae_calibrated'] = mean_absolute_error(dose_target, dose_pred_cal)
-            results['dose_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dose_target, dose_pred_cal)))
-            results['dose_mean_pred_calibrated'] = float(np.mean(dose_pred_cal))
+        if active_calibration_method in {'affine', 'isotonic'} and active_calibration_bundle is not None:
+            dose_cal_obj = active_calibration_bundle.get("dose", None)
+            if dose_cal_obj is not None:
+                dose_pred_cal = apply_posthoc_calibration_bundle(dose_pred, active_calibration_bundle, "dose")
+                results['dose_calibration'] = active_calibration_method
+                fit_source = str(active_calibration_bundle.get("fit_source", "")).strip()
+                if fit_source:
+                    results['dose_calibration_fit_source'] = fit_source
+                if active_calibration_method == 'affine':
+                    results['dose_calibration_a'] = float(dose_cal_obj['a'])
+                    results['dose_calibration_b'] = float(dose_cal_obj['b'])
+                elif active_calibration_method == 'isotonic':
+                    results['dose_calibration_n_knots'] = int(dose_cal_obj.get("n_knots", 0))
+                results['dose_mae_calibrated'] = mean_absolute_error(dose_target, dose_pred_cal)
+                results['dose_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dose_target, dose_pred_cal)))
+                try:
+                    results['dose_r2_calibrated'] = r2_score(dose_target, dose_pred_cal)
+                except Exception:
+                    results['dose_r2_calibrated'] = np.nan
+                results['dose_mean_pred_calibrated'] = float(np.mean(dose_pred_cal))
 
         # Optional interpretability metric for near-discrete targets.
         dose_target_round = np.rint(dose_target)
@@ -692,15 +809,26 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
         results['dur_mean_pred'] = float(np.mean(dur_pred_arr))
         results['dur_support'] = int(len(dur_target_arr))
 
-        if posthoc_calibration == 'affine':
-            a_dur, b_dur = fit_affine_calibration(dur_pred_arr, dur_target_arr)
-            dur_pred_cal = apply_affine_calibration(dur_pred_arr, a_dur, b_dur)
-            results['dur_calibration'] = 'affine'
-            results['dur_calibration_a'] = float(a_dur)
-            results['dur_calibration_b'] = float(b_dur)
-            results['dur_mae_calibrated'] = mean_absolute_error(dur_target_arr, dur_pred_cal)
-            results['dur_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dur_target_arr, dur_pred_cal)))
-            results['dur_mean_pred_calibrated'] = float(np.mean(dur_pred_cal))
+        if active_calibration_method in {'affine', 'isotonic'} and active_calibration_bundle is not None:
+            dur_cal_obj = active_calibration_bundle.get("dur", None)
+            if dur_cal_obj is not None:
+                dur_pred_cal = apply_posthoc_calibration_bundle(dur_pred_arr, active_calibration_bundle, "dur")
+                results['dur_calibration'] = active_calibration_method
+                fit_source = str(active_calibration_bundle.get("fit_source", "")).strip()
+                if fit_source:
+                    results['dur_calibration_fit_source'] = fit_source
+                if active_calibration_method == 'affine':
+                    results['dur_calibration_a'] = float(dur_cal_obj['a'])
+                    results['dur_calibration_b'] = float(dur_cal_obj['b'])
+                elif active_calibration_method == 'isotonic':
+                    results['dur_calibration_n_knots'] = int(dur_cal_obj.get("n_knots", 0))
+                results['dur_mae_calibrated'] = mean_absolute_error(dur_target_arr, dur_pred_cal)
+                results['dur_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dur_target_arr, dur_pred_cal)))
+                try:
+                    results['dur_r2_calibrated'] = r2_score(dur_target_arr, dur_pred_cal)
+                except Exception:
+                    results['dur_r2_calibrated'] = np.nan
+                results['dur_mean_pred_calibrated'] = float(np.mean(dur_pred_cal))
         results['dur_note'] = drug_token_note
 
     # ============================================================
@@ -713,6 +841,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps", posthoc
         results['dur_mdn_nll'] = mdn_nll_dur_sum / mdn_nll_dur_count
         results['dur_mdn_nll_support'] = mdn_nll_dur_count
 
+    if return_calibration_bundle:
+        return results, active_calibration_bundle
     return results
 
 
@@ -736,6 +866,10 @@ def evaluate_auc_pipeline(
     meta_info={},
     train_valid_tokens=None,  # Set of tokens present in train data (for filtering)
     posthoc_calibration='none',
+    calibration_bundle=None,
+    fit_calibration_on_this_split=False,
+    calibration_fit_source='',
+    return_calibration_bundle=False,
 ):
     """
     Runs the AUC evaluation pipeline.
@@ -844,8 +978,12 @@ def evaluate_auc_pipeline(
     pred_idx_precompute = (d[1][:, :, np.newaxis] <= d[3][:, np.newaxis, :] - offset).sum(1) - 1
 
     all_aucs = []
+    # Keep internal option name "duration", but adapt to tqdm's accepted key "total".
     tqdm_options = {"desc": "Processing disease chunks", "duration": len(diseases_chunks)}
-    for disease_chunk_idx, diseases_chunk in tqdm(enumerate(diseases_chunks), **tqdm_options):
+    tqdm_kwargs = dict(tqdm_options)
+    if "duration" in tqdm_kwargs and "total" not in tqdm_kwargs:
+        tqdm_kwargs["total"] = tqdm_kwargs.pop("duration")
+    for disease_chunk_idx, diseases_chunk in tqdm(enumerate(diseases_chunks), **tqdm_kwargs):
         # Filter out invalid indices for this chunk
         diseases_chunk = np.array(diseases_chunk)
         valid_mask = (diseases_chunk >= 0) & (diseases_chunk < vocab_size)
@@ -976,11 +1114,25 @@ def evaluate_auc_pipeline(
     
     # Evaluate composite fields (DOSE, DURATION) if composite model and enabled
     composite_metrics = None
+    fitted_calibration_bundle = None
     if evaluate_composite:
         print("\nEvaluating composite fields (DOSE, DURATION)...")
-        composite_metrics = evaluate_composite_fields(
-            model, d100k, batch_size=batch_size, device=device, posthoc_calibration=posthoc_calibration
+        composite_eval_out = evaluate_composite_fields(
+            model,
+            d100k,
+            batch_size=batch_size,
+            device=device,
+            posthoc_calibration=posthoc_calibration,
+            calibration_bundle=calibration_bundle,
+            fit_calibration=fit_calibration_on_this_split,
+            calibration_fit_source=calibration_fit_source,
+            return_calibration_bundle=return_calibration_bundle,
         )
+        if return_calibration_bundle:
+            composite_metrics, fitted_calibration_bundle = composite_eval_out
+        else:
+            composite_metrics = composite_eval_out
+            fitted_calibration_bundle = None
         
         # Print results
         print("\nComposite Field Evaluation Results:")
@@ -1007,6 +1159,8 @@ def evaluate_auc_pipeline(
             if 'dose_mae_calibrated' in composite_metrics:
                 print(f"  MAE (calibrated): {composite_metrics['dose_mae_calibrated']:.4f}")
                 print(f"  RMSE (calibrated): {composite_metrics['dose_rmse_calibrated']:.4f}")
+                if 'dose_r2_calibrated' in composite_metrics and not np.isnan(composite_metrics['dose_r2_calibrated']):
+                    print(f"  R² (calibrated): {composite_metrics['dose_r2_calibrated']:.4f}")
         else:
             print("DOSE: n/a")
 
@@ -1029,6 +1183,8 @@ def evaluate_auc_pipeline(
             if 'dur_mae_calibrated' in composite_metrics:
                 print(f"  MAE (calibrated): {composite_metrics['dur_mae_calibrated']:.4f}")
                 print(f"  RMSE (calibrated): {composite_metrics['dur_rmse_calibrated']:.4f}")
+                if 'dur_r2_calibrated' in composite_metrics and not np.isnan(composite_metrics['dur_r2_calibrated']):
+                    print(f"  R² (calibrated): {composite_metrics['dur_r2_calibrated']:.4f}")
         else:
             print("DURATION: n/a")
 
@@ -1073,6 +1229,8 @@ def evaluate_auc_pipeline(
         df_auc_merged.to_parquet(f"{output_path}/df_both.parquet", index=False)
         df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled.parquet", index=False)
 
+    if return_calibration_bundle:
+        return df_auc_unpooled_merged, df_auc_merged, composite_metrics, fitted_calibration_bundle
     return df_auc_unpooled_merged, df_auc_merged, composite_metrics
 
 
@@ -1104,8 +1262,17 @@ def main():
                         help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin")
     parser.add_argument("--train_data_file", type=str, default="dose/kr_train.bin",
                         help="Train data file to filter valid tokens. Only tokens present in train data will be evaluated.")
-    parser.add_argument("--posthoc_calibration", type=str, default="none", choices=["none", "affine"],
+    parser.add_argument("--posthoc_calibration", type=str, default="none", choices=["none", "affine", "isotonic"],
                         help="Optional post-hoc calibration for regression outputs.")
+    parser.add_argument(
+        "--calibration_fit_prefix",
+        type=str,
+        default="",
+        help=(
+            "When set (e.g., 'val') and posthoc_calibration!=none, fit calibration only on this split "
+            "and apply it to other splits. Empty = per-split self-fit (legacy behavior)."
+        ),
+    )
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -1114,6 +1281,7 @@ def main():
     no_event_token_rate = args.no_event_token_rate
     dataset_subset_size = args.dataset_subset_size
     ckpt_path = args.model_ckpt_path
+    calibration_fit_prefix = str(args.calibration_fit_prefix).strip().lower()
 
     # Resolve output path: default to checkpoint directory.
     if output_path is None or str(output_path).strip() == "" or str(output_path).lower() == "auto":
@@ -1185,6 +1353,12 @@ def main():
         print(f"  Number of experts: {num_experts}")
         print(f"  Experts per token: {experts_per_token}")
     print(f"  Parameters: {model.get_num_params()/1e6:.2f}M")
+    print(f"  Post-hoc calibration: {args.posthoc_calibration}")
+    if str(args.posthoc_calibration).lower() != "none":
+        if calibration_fit_prefix:
+            print(f"  Calibration fit split: {calibration_fit_prefix} (apply-only on other splits)")
+        else:
+            print("  Calibration fit split: each split (self-fit)")
     print(f"{'='*60}\n")
 
     # Load labels (external) to be passed in.
@@ -1315,6 +1489,7 @@ def main():
 
     # Process each data file
     all_results = {}
+    shared_calibration_bundle = None
     for data_filename, prefix in data_files_list:
         data_filepath = f"{input_path}/{data_filename}"
         
@@ -1367,6 +1542,33 @@ def main():
         meta_info = base_meta_info.copy()
         meta_info['data_source'] = data_filename
         meta_info['data_prefix'] = prefix
+
+        # Calibration protocol:
+        # - calibration_fit_prefix set: fit once on that split, apply-only on others
+        # - calibration_fit_prefix empty: legacy self-fit per split
+        split_prefix = str(prefix).strip().lower()
+        use_composite_eval = (prefix != 'extval_ukb')
+        use_posthoc = (str(args.posthoc_calibration).lower() != 'none') and use_composite_eval
+        fit_calibration_on_this_split = False
+        calibration_bundle_for_split = None
+        calibration_fit_source = ""
+        posthoc_calibration_for_split = args.posthoc_calibration
+        if use_posthoc:
+            if calibration_fit_prefix:
+                if split_prefix == calibration_fit_prefix:
+                    fit_calibration_on_this_split = True
+                    calibration_fit_source = split_prefix
+                elif shared_calibration_bundle is not None:
+                    calibration_bundle_for_split = shared_calibration_bundle
+                else:
+                    print(
+                        f"[calibration] fit split='{calibration_fit_prefix}' has not run yet; "
+                        f"running '{split_prefix}' without calibration."
+                    )
+                    posthoc_calibration_for_split = "none"
+            else:
+                fit_calibration_on_this_split = True
+                calibration_fit_source = split_prefix
         
         # Call the internal evaluation function (don't save files yet - we'll save with prefix)
         result = evaluate_auc_pipeline(
@@ -1376,7 +1578,7 @@ def main():
             labels_df=labels_df,
             model_type=model_type,
             # UKB external validation: only AUC is needed (skip DOSE/DURATION)
-            evaluate_composite=(prefix != 'extval_ukb'),
+            evaluate_composite=use_composite_eval,
             diseases_of_interest=None,
             filter_min_total=args.filter_min_total,
             disease_chunk_size=args.disease_chunk_size,
@@ -1386,10 +1588,21 @@ def main():
             n_bootstrap=args.n_bootstrap,
             meta_info=meta_info,
             train_valid_tokens=train_valid_tokens,
-            posthoc_calibration=args.posthoc_calibration,
+            posthoc_calibration=posthoc_calibration_for_split,
+            calibration_bundle=calibration_bundle_for_split,
+            fit_calibration_on_this_split=fit_calibration_on_this_split,
+            calibration_fit_source=calibration_fit_source,
+            return_calibration_bundle=True,
         )
-        
-        df_auc_unpooled, df_auc_merged, composite_metrics = result
+
+        df_auc_unpooled, df_auc_merged, composite_metrics, fitted_calibration_bundle = result
+
+        if fit_calibration_on_this_split and fitted_calibration_bundle is not None:
+            shared_calibration_bundle = fitted_calibration_bundle
+            print(
+                f"[calibration] fitted on split='{split_prefix}' "
+                f"(method={shared_calibration_bundle.get('method', 'none')})"
+            )
 
         if composite_metrics is None:
             composite_metrics = {}
