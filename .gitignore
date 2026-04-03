@@ -16,10 +16,12 @@ ablation/**/train_out/
 ablation/**/logs/
 wandb/
 prev_model_ver/
+prev/
 out_dann/
 0319_1839_out/
 0319_2059_out/
 *_dann.py
+experiments/
 
 sampling_trajectories_.ipynb
 sampling_trajectories_v6.ipynb

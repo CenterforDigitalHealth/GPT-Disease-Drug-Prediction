@@ -4,7 +4,7 @@ import warnings
 import torch
 # Suppress sklearn warnings about classes not in y_true
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn.metrics._classification')
-from model import CompositeDelphi, CompositeDelphiConfig
+from model_v4 import CompositeDelphi, CompositeDelphiConfig
 from tqdm import tqdm
 import pandas as pd
 import numpy as np
@@ -12,9 +12,9 @@ import argparse
 from utils import get_batch_composite, get_p2i_composite
 from pathlib import Path
 from sklearn.metrics import (
-    accuracy_score, 
-    top_k_accuracy_score, 
-    mean_absolute_error, 
+    accuracy_score,
+    top_k_accuracy_score,
+    mean_absolute_error,
     mean_squared_error,
     balanced_accuracy_score,
     f1_score,
@@ -22,9 +22,46 @@ from sklearn.metrics import (
     recall_score,
     classification_report,
     r2_score,
-    confusion_matrix
+    confusion_matrix,
+    roc_auc_score
 )
-from sklearn.isotonic import IsotonicRegression
+
+
+def remap_shift_to_change_torch(shift_values: torch.Tensor, apply_token_shift: bool, num_classes: int = 3):
+    """
+    Remap SHIFT labels to class indices.
+
+    num_classes=3: decrease(0) / maintain(1) / increase(2)
+    num_classes=2: label1->0, label2or3->1 (binary fallback)
+
+    Returns:
+      mapped_targets, valid_mask
+    """
+    if apply_token_shift:
+        is_label1 = shift_values == 2
+        is_label2 = shift_values == 3
+        is_label3 = shift_values == 4
+    else:
+        is_label1 = shift_values == 1
+        is_label2 = shift_values == 2
+        is_label3 = shift_values == 3
+
+    valid_mask = is_label1 | is_label2 | is_label3
+    mapped = torch.full_like(shift_values, fill_value=-1)
+    if num_classes == 3:
+        mapped[is_label1] = 0  # decrease
+        mapped[is_label2] = 1  # maintain
+        mapped[is_label3] = 2  # increase
+    else:
+        mapped[is_label1] = 0
+        mapped[is_label2 | is_label3] = 1
+    return mapped, valid_mask
+
+
+# Backward-compatible alias
+def remap_shift_to_binary_change_torch(shift_values, apply_token_shift):
+    return remap_shift_to_change_torch(shift_values, apply_token_shift, num_classes=2)
+
 
 def auc(x1, x2):
     n1 = len(x1)
@@ -45,7 +82,7 @@ def get_common_diseases(labels_df, filter_min_total=100):
         filter_min_total: Minimum count to include a token
     
     Returns:
-        List of shifted token IDs (labels.csv index + 1, due to +1 dose in get_batch_composite)
+        List of shifted token IDs (labels.csv index + 1, due to +1 shift in get_batch_composite)
     """
     if 'count' in labels_df.columns:
         labels_df_filtered = labels_df[labels_df['count'] > filter_min_total]
@@ -55,137 +92,36 @@ def get_common_diseases(labels_df, filter_min_total=100):
         labels_df_filtered = labels_df[labels_df['index'] > 20]
     
     # labels.csv 'index' = raw data value
-    # get_batch_composite applies +1 dose to all DATA tokens
+    # get_batch_composite applies +1 shift to all DATA tokens
     # Therefore, shifted token ID = raw data value + 1
     raw_indices = labels_df_filtered['index'].tolist()
     shifted_tokens = [idx + 1 for idx in raw_indices]
     return shifted_tokens
 
 
-def get_dose_label_indices(apply_token_shift: bool):
-    """Return DOSE label ids for (decrease, maintain, increase)."""
-    if apply_token_shift:
-        return 2, 3, 4
-    return 1, 2, 3
+def finalize_token_columns(df):
+    """Make raw-vs-shifted token ids explicit in exported evaluation tables."""
+    if df is None or df.empty or 'token' not in df.columns:
+        return df
 
+    df = df.copy()
 
-def hierarchical_logits_to_dose_labels(
-    change_logits: torch.Tensor,
-    direction_logits: torch.Tensor,
-    apply_token_shift: bool,
-) -> torch.Tensor:
-    """
-    Convert hierarchical DOSE predictions to 3-class labels.
-    - stage1: maintain(0) vs changed(1)
-    - stage2: decrease(0) vs increase(1) for changed
-    """
-    dec_idx, maintain_idx, inc_idx = get_dose_label_indices(apply_token_shift)
-    change_pred = torch.argmax(change_logits, dim=-1)
-    direction_pred = torch.argmax(direction_logits, dim=-1)
-    dose_pred = torch.full_like(change_pred, fill_value=maintain_idx)
-    changed_mask = change_pred == 1
-    dose_pred[changed_mask & (direction_pred == 0)] = dec_idx
-    dose_pred[changed_mask & (direction_pred == 1)] = inc_idx
-    return dose_pred
+    if 'shifted_token' not in df.columns:
+        df['shifted_token'] = df['token']
+    # Keep `token` as a backward-compatible alias used by plotting code.
+    df['token'] = df['shifted_token']
 
+    if 'index' in df.columns and 'raw_token' not in df.columns:
+        df['raw_token'] = df['index']
 
-def fit_affine_calibration(pred: np.ndarray, target: np.ndarray):
-    """Fit y ~= a * pred + b using least squares."""
-    pred = np.asarray(pred, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    if pred.size == 0 or target.size == 0:
-        return 1.0, 0.0
-    x_mean = float(pred.mean())
-    y_mean = float(target.mean())
-    x_var = float(np.var(pred))
-    if x_var < 1e-12:
-        return 1.0, y_mean - x_mean
-    cov_xy = float(np.mean((pred - x_mean) * (target - y_mean)))
-    a = cov_xy / x_var
-    b = y_mean - a * x_mean
-    return float(a), float(b)
+    for col in ('token', 'shifted_token', 'index', 'raw_token'):
+        if col in df.columns:
+            df[col] = df[col].astype(np.int64)
 
-
-def apply_affine_calibration(pred: np.ndarray, a: float, b: float):
-    return a * np.asarray(pred, dtype=np.float64) + b
-
-
-def fit_isotonic_calibration(pred: np.ndarray, target: np.ndarray):
-    """Fit monotonic isotonic calibration map y ~= f(pred)."""
-    pred = np.asarray(pred, dtype=np.float64)
-    target = np.asarray(target, dtype=np.float64)
-    if pred.size == 0 or target.size == 0:
-        return None
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(pred, target)
-    return iso
-
-
-def apply_isotonic_calibration(pred: np.ndarray, iso_model):
-    pred = np.asarray(pred, dtype=np.float64)
-    if iso_model is None:
-        return pred
-    return iso_model.predict(pred)
-
-
-def fit_posthoc_calibration_bundle(
-    method: str,
-    *,
-    dose_pred: np.ndarray,
-    dose_target: np.ndarray,
-    dur_pred: np.ndarray,
-    dur_target: np.ndarray,
-    fit_source: str = "",
-):
-    """Fit calibration params/models for DOSE and DURATION."""
-    method = str(method).lower()
-    bundle = {
-        "method": method,
-        "fit_source": str(fit_source),
-        "dose": None,
-        "dur": None,
-    }
-    if method == "none":
-        return bundle
-    if method == "affine":
-        if dose_pred.size > 0 and dose_target.size > 0:
-            a_dose, b_dose = fit_affine_calibration(dose_pred, dose_target)
-            bundle["dose"] = {"a": float(a_dose), "b": float(b_dose)}
-        if dur_pred.size > 0 and dur_target.size > 0:
-            a_dur, b_dur = fit_affine_calibration(dur_pred, dur_target)
-            bundle["dur"] = {"a": float(a_dur), "b": float(b_dur)}
-        return bundle
-    if method == "isotonic":
-        if dose_pred.size > 0 and dose_target.size > 0:
-            iso_dose = fit_isotonic_calibration(dose_pred, dose_target)
-            bundle["dose"] = {
-                "model": iso_dose,
-                "n_knots": int(len(getattr(iso_dose, "X_thresholds_", []))) if iso_dose is not None else 0,
-            }
-        if dur_pred.size > 0 and dur_target.size > 0:
-            iso_dur = fit_isotonic_calibration(dur_pred, dur_target)
-            bundle["dur"] = {
-                "model": iso_dur,
-                "n_knots": int(len(getattr(iso_dur, "X_thresholds_", []))) if iso_dur is not None else 0,
-            }
-        return bundle
-    raise ValueError(f"Unknown posthoc calibration method: {method}")
-
-
-def apply_posthoc_calibration_bundle(pred: np.ndarray, bundle: dict, head: str) -> np.ndarray:
-    """Apply pre-fit calibration bundle to one head ('dose' or 'dur')."""
-    if not bundle:
-        return np.asarray(pred, dtype=np.float64)
-    method = str(bundle.get("method", "none")).lower()
-    head_obj = bundle.get(head, None)
-    pred = np.asarray(pred, dtype=np.float64)
-    if method == "none" or head_obj is None:
-        return pred
-    if method == "affine":
-        return apply_affine_calibration(pred, float(head_obj["a"]), float(head_obj["b"]))
-    if method == "isotonic":
-        return apply_isotonic_calibration(pred, head_obj.get("model", None))
-    raise ValueError(f"Unknown posthoc calibration method: {method}")
+    preferred = ['raw_token', 'shifted_token', 'token', 'name']
+    ordered = [c for c in preferred if c in df.columns]
+    ordered += [c for c in df.columns if c not in ordered]
+    return df[ordered]
 
 
 def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
@@ -216,7 +152,7 @@ def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
 
     n_case = case.size(0)
     n_control = control.size(0)
-    dur = n_case + n_control
+    total = n_case + n_control
 
     # Generate bootstrap samples
     boot_idx_case = torch.randint(0, n_case, (n_bootstrap, n_case), device="cuda")
@@ -228,7 +164,7 @@ def optimized_bootstrapped_auc_gpu(case, control, n_bootstrap=1000):
     combined = torch.cat([boot_case, boot_control], dim=1)
 
     # Mask to identify case entries
-    mask = torch.zeros((n_bootstrap, dur), dtype=torch.bool, device="cuda")
+    mask = torch.zeros((n_bootstrap, total), dtype=torch.bool, device="cuda")
     mask[:, :n_case] = True
 
     # Compute ranks and AUC
@@ -510,19 +446,9 @@ def get_calibration_auc(j, k, d, p, diseases_chunk, offset=365.25, age_groups=ra
     return out
 
 
-def evaluate_composite_fields(
-    model,
-    d100k,
-    batch_size=64,
-    device="mps",
-    posthoc_calibration='none',
-    calibration_bundle=None,
-    fit_calibration=False,
-    calibration_fit_source='',
-    return_calibration_bundle=False,
-):
+def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
     """
-    Evaluate DOSE, DURATION predictions for CompositeDelphi model.
+    Evaluate binary CHANGE(from SHIFT), TOTAL predictions for CompositeDelphi model.
     
     Args:
         model: CompositeDelphi model
@@ -535,44 +461,30 @@ def evaluate_composite_fields(
     """
     model.eval()
     model.to(device)
+    all_predictions = {'shift': [], 'total': []}
+    all_targets = {'shift': [], 'total': []}
+    # For regression, also compute "positive-only" metrics (targets > 0), since zeros dominate in these fields.
+    all_predictions_pos = {'total': []}
+    all_targets_pos = {'total': []}
 
-    # Drug-token predictions only (primary metrics)
-    all_predictions_dose = []
-    all_predictions_dur = []
-    all_targets_dose = []
-    all_targets_dur = []
+    # Softmax probabilities for SHIFT AUC computation
+    all_shift_probs = []
+    all_shift_probs_drug_cond = []
 
-    # MDN NLL accumulators (drug-token only)
-    mdn_nll_dose_sum, mdn_nll_dose_count = 0.0, 0
-    mdn_nll_dur_sum, mdn_nll_dur_count = 0.0, 0
+    # Drug-conditioned predictions (if model uses drug-conditioning)
+    # Only evaluated for drug tokens within configured range.
+    all_predictions_shift_drug_cond = []
+    all_predictions_total_drug_cond = []
+    all_targets_shift_drug_cond = []  # Targets for drug-conditioned SHIFT
+    all_targets_total_drug_cond = []  # Targets for drug-conditioned TOTAL
     use_drug_conditioning = getattr(model.config, 'use_drug_conditioning', False)
-    eval_apply_token_shift = bool(getattr(model.config, 'apply_token_shift', False))
-    eval_dose_continuous = bool(getattr(model.config, 'dose_continuous', False))
-    eval_dose_exclude_na_token = bool(getattr(model.config, 'dose_exclude_na_token', True))
-    eval_separate_dose_na = bool(getattr(model.config, 'separate_dose_na_from_padding', False))
-    # Continuous DOSE regression should not treat value 0 as a special NA token.
-    if eval_dose_continuous and eval_separate_dose_na:
-        eval_separate_dose_na = False
-    eval_dose_na_token = int(getattr(model.config, 'dose_na_raw_token', 4))
-    if eval_apply_token_shift:
-        eval_dose_na_token += 1
-    dose_min_eval = float(getattr(model.config, 'dose_min_value', -1.0))
-    dose_max_eval = float(getattr(model.config, 'dose_max_value', -1.0))
-    if dose_max_eval <= dose_min_eval:
-        if eval_dose_continuous:
-            dose_min_eval = 0.0
-            dose_max_eval = float(getattr(model.config, 'dur_max_value', 550.0))
-        elif eval_apply_token_shift:
-            dose_min_eval, dose_max_eval = 2.0, 4.0
-        else:
-            dose_min_eval, dose_max_eval = 1.0, 3.0
-    dec_idx, maintain_idx, inc_idx = get_dose_label_indices(eval_apply_token_shift)
     drug_token_min = int(getattr(model.config, 'drug_token_min', 1278))
     drug_token_max = int(getattr(model.config, 'drug_token_max', 1288))
+    eval_apply_token_shift = bool(getattr(model.config, 'apply_token_shift', False))
     drug_token_note = f"Metrics computed only for drug tokens ({drug_token_min}-{drug_token_max})"
     
-    x_data, x_dose, x_dur, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
-    y_data, y_dose, y_dur, y_ages = d100k[4], d100k[5], d100k[6], d100k[7]
+    x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
+    y_data, y_shift, y_total, y_ages = d100k[4], d100k[5], d100k[6], d100k[7]
     
     num_batches = (x_data.shape[0] + batch_size - 1) // batch_size
     
@@ -582,267 +494,277 @@ def evaluate_composite_fields(
             end_idx = min(start_idx + batch_size, x_data.shape[0])
             
             batch_x_data = x_data[start_idx:end_idx].to(device)
-            batch_x_dose = x_dose[start_idx:end_idx].to(device)
-            batch_x_dur = x_dur[start_idx:end_idx].to(device)
+            batch_x_shift = x_shift[start_idx:end_idx].to(device)
+            batch_x_total = x_total[start_idx:end_idx].to(device)
             batch_x_ages = x_ages[start_idx:end_idx].to(device)
             
             # Get targets on device
             batch_y_data = y_data[start_idx:end_idx].to(device)
-            batch_y_dose = y_dose[start_idx:end_idx].to(device)
-            batch_y_dur = y_dur[start_idx:end_idx].to(device)
+            batch_y_shift = y_shift[start_idx:end_idx].to(device)
+            batch_y_total = y_total[start_idx:end_idx].to(device)
             
-            # Pass targets for drugitioning evaluation (uses GT drug embedding)
+            # Pass targets for drug-conditioning evaluation (uses GT drug embedding)
             outputs = model(
-                batch_x_data, batch_x_dose, batch_x_dur, batch_x_ages,
-                targets_data=batch_y_data, targets_dose=batch_y_dose, 
-                targets_dur=batch_y_dur,
+                batch_x_data, batch_x_shift, batch_x_total, batch_x_ages,
+                targets_data=batch_y_data, targets_shift=batch_y_shift, 
+                targets_total=batch_y_total,
                 targets_age=y_ages[start_idx:end_idx].to(device)
             )[0]  # Get logits dict
             
-            # DOSE: regression output (B, T)
-            # DURATION: regression output (B, T)
-            dose_pred = outputs['dose']
-            dur_pred = outputs['duration']
+            # Get predictions on device
+            # ============================================================
+            # - SHIFT: logits (B, T, num_shift_classes), supports 2 or 3 classes
+            # - TOTAL: total_head → (B, T) regression output (continuous)
+            # ============================================================
+            shift_logits = outputs['shift']  # (B, T, C) where C = num_shift_classes
+            total_pred = outputs['total']  # (B, T) - regression output
 
-            # DOSE log handling:
-            # - New checkpoints (dose_log=True): model already outputs raw-space DOSE.
-            # - Legacy checkpoints (dose_log_transform=True, non-MDN): outputs may be log-space.
-            dose_log = bool(getattr(model.config, 'dose_log', False))
-            dose_log_transform_legacy = bool(getattr(model.config, 'dose_log_transform', False))
-            has_mdn_dose = isinstance(outputs.get('dose_mdn', None), dict)
-            if dose_log_transform_legacy and (not dose_log) and (not has_mdn_dose):
-                dose_pred = torch.expm1(dose_pred)
+            # Inverse log-transform if model was trained with total_log_transform
+            total_log_transform = getattr(model.config, 'total_log_transform', False)
+            has_mdn_total = isinstance(outputs.get('total_mdn', None), dict)
+            if total_log_transform and not has_mdn_total:
+                total_pred = torch.expm1(total_pred)  # inverse of log1p
 
-            # Inverse log-transform if model was trained with dur_log_transform
-            dur_log_transform = getattr(model.config, 'dur_log_transform', False)
-            has_mdn_total = isinstance(outputs.get('dur_mdn', None), dict)
-            if dur_log_transform and not has_mdn_total:
-                dur_pred = torch.expm1(dur_pred)  # inverse of log1p
+            # SHIFT: N-class classification
+            eval_num_shift_classes = shift_logits.size(-1)
+            shift_pred = torch.argmax(shift_logits, dim=-1)  # (B, T)
 
-            # Defensive compatibility handling for unexpected checkpoint outputs.
-            if dose_pred.dim() == 3:
-                if dose_pred.size(-1) == 1:
-                    dose_pred = dose_pred.squeeze(-1)
-                else:
-                    dose_pred = torch.argmax(dose_pred, dim=-1).float()
-            
+            shift_target_mapped, shift_valid = remap_shift_to_change_torch(
+                batch_y_shift, apply_token_shift=eval_apply_token_shift,
+                num_classes=eval_num_shift_classes
+            )
+
             # Use per-field valid masks
-            valid_data_mask = (batch_y_data != -1) & (batch_y_data > 0)
-            if eval_dose_continuous:
-                dose_mask = valid_data_mask & (batch_y_dose != -1) & (batch_y_dose >= 0)
-                if eval_separate_dose_na and eval_dose_exclude_na_token:
-                    dose_mask = dose_mask & (batch_y_dose != eval_dose_na_token)
-            else:
-                dose_mask = (
-                    (batch_y_dose == dec_idx)
-                    | (batch_y_dose == maintain_idx)
-                    | (batch_y_dose == inc_idx)
-                )
-                dose_mask = dose_mask & valid_data_mask
-            dur_mask = (batch_y_dur != -1) & (batch_y_dur >= 0)
+            shift_mask = shift_valid
+            total_mask = (batch_y_total != -1) & (batch_y_total >= 0)
             
-            # Drug token mask: only evaluate drugitioned predictions for configured drug range
+            # Drug token mask: only evaluate drug-conditioned predictions for configured drug range
             drug_token_mask = (batch_y_data >= drug_token_min) & (batch_y_data <= drug_token_max)
 
-            # DOSE (drug-token only regression)
-            if dose_mask.any() and use_drug_conditioning and 'dose_drug_cond' in outputs:
-                dose_drug_pred = outputs['dose_drug_cond']
-                has_mdn_drug_dose = isinstance(outputs.get('dose_mdn_drug_cond', None), dict)
-                if dose_log_transform_legacy and (not dose_log) and (not has_mdn_drug_dose):
-                    dose_drug_pred = torch.expm1(dose_drug_pred)
-                if dose_drug_pred.dim() == 3:
-                    if dose_drug_pred.size(-1) == 1:
-                        dose_drug_pred = dose_drug_pred.squeeze(-1)
-                    else:
-                        dose_drug_pred = torch.argmax(dose_drug_pred, dim=-1).float()
-                drug_dose_mask = dose_mask & drug_token_mask
-                if drug_dose_mask.any():
-                    all_predictions_dose.append(dose_drug_pred[drug_dose_mask].float().cpu().numpy())
-                    all_targets_dose.append(batch_y_dose[drug_dose_mask].float().cpu().numpy())
+            # SHIFT (classification): store predictions/targets/probs for valid shift tokens
+            if shift_mask.any():
+                all_predictions['shift'].append(shift_pred[shift_mask].cpu().numpy())
+                all_targets['shift'].append(shift_target_mapped[shift_mask].cpu().numpy())
+                shift_probs = torch.softmax(shift_logits, dim=-1)
+                all_shift_probs.append(shift_probs[shift_mask].cpu().numpy())
 
-            # DURATION (drug-token only regression)
-            if dur_mask.any() and use_drug_conditioning and 'dur_drug_cond' in outputs:
-                drug_dur_mask = dur_mask & drug_token_mask
-                if drug_dur_mask.any():
-                    tp_drug = outputs['dur_drug_cond'][drug_dur_mask]
-                    has_mdn_drug_dur = isinstance(outputs.get('dur_mdn_drug_cond', None), dict)
-                    if dur_log_transform and not has_mdn_drug_dur:
-                        tp_drug = torch.expm1(tp_drug)
-                    tp_drug = torch.clamp(tp_drug, min=0.0)
-                    all_predictions_dur.append(tp_drug.cpu().numpy())
-                    all_targets_dur.append(batch_y_dur[drug_dur_mask].float().cpu().numpy())
+                # Drug-conditioned SHIFT (if available) - ONLY for drug tokens
+                if use_drug_conditioning and 'shift_drug_cond' in outputs:
+                    shift_drug_logits = outputs['shift_drug_cond']
+                    shift_drug_pred = torch.argmax(shift_drug_logits, dim=-1)
+                    shift_drug_probs = torch.softmax(shift_drug_logits, dim=-1)
+                    # Filter: only drug tokens AND valid shift tokens
+                    drug_shift_mask = shift_mask & drug_token_mask
+                    if drug_shift_mask.any():
+                        all_predictions_shift_drug_cond.append(shift_drug_pred[drug_shift_mask].cpu().numpy())
+                        all_targets_shift_drug_cond.append(shift_target_mapped[drug_shift_mask].cpu().numpy())
+                        all_shift_probs_drug_cond.append(shift_drug_probs[drug_shift_mask].cpu().numpy())
 
-            # ---- MDN NLL evaluation (drug-token only) ----
-            # DOSE MDN NLL
-            if use_drug_conditioning and 'dose_mdn_drug_cond' in outputs:
-                dose_mdn_drug_src = outputs['dose_mdn_drug_cond']
-                drug_dose_mask = dose_mask & drug_token_mask
-                if isinstance(dose_mdn_drug_src, dict) and drug_dose_mask.any():
-                    _pi = dose_mdn_drug_src['pi_logits'][drug_dose_mask]
-                    _mu = dose_mdn_drug_src['mu'][drug_dose_mask]
-                    _ls = dose_mdn_drug_src['log_s'][drug_dose_mask]
-                    _y = batch_y_dose[drug_dose_mask].float().unsqueeze(-1)
-                    _z = (_y - _mu) / torch.exp(_ls)
-                    _log_pdf = -_z - _ls - 2.0 * torch.nn.functional.softplus(-_z)
-                    _log_pi = torch.nn.functional.log_softmax(_pi, dim=-1)
-                    _nll = -torch.logsumexp(_log_pi + _log_pdf, dim=-1)
-                    _nll = torch.clamp(_nll, min=0.0, max=200.0)
-                    mdn_nll_dose_sum += float(_nll.sum().item())
-                    mdn_nll_dose_count += int(_nll.numel())
+            # TOTAL (regression): store clipped predictions to match domain (non-negative)
+            if total_mask.any():
+                tp = total_pred[total_mask]
+                tt = batch_y_total[total_mask].float()
+                all_predictions['total'].append(torch.clamp(tp, min=0.0).cpu().numpy())
+                all_targets['total'].append(tt.cpu().numpy())
+                
+                # Drug-conditioned TOTAL (if available) - ONLY for drug tokens
+                # Create drug_total_mask BEFORE filtering by total_mask
+                if use_drug_conditioning and 'total_drug_cond' in outputs:
+                    # Filter: only drug tokens AND valid total tokens
+                    drug_total_mask = total_mask & drug_token_mask
+                    if drug_total_mask.any():
+                        # Apply drug_total_mask directly to outputs (before total_mask filtering)
+                        tp_drug = outputs['total_drug_cond'][drug_total_mask]
+                        has_mdn_drug_total = isinstance(outputs.get('total_mdn_drug_cond', None), dict)
+                        if total_log_transform and not has_mdn_drug_total:
+                            tp_drug = torch.expm1(tp_drug)
+                        tp_drug = torch.clamp(tp_drug, min=0.0)
+                        all_predictions_total_drug_cond.append(tp_drug.cpu().numpy())
+                        all_targets_total_drug_cond.append(batch_y_total[drug_total_mask].float().cpu().numpy())
 
-            # DURATION MDN NLL
-            if use_drug_conditioning and 'dur_mdn_drug_cond' in outputs:
-                dur_mdn_drug_src = outputs['dur_mdn_drug_cond']
-                drug_dur_mask = dur_mask & drug_token_mask
-                if isinstance(dur_mdn_drug_src, dict) and drug_dur_mask.any():
-                    _pi = dur_mdn_drug_src['pi_logits'][drug_dur_mask]
-                    _mu = dur_mdn_drug_src['mu'][drug_dur_mask]
-                    _ls = dur_mdn_drug_src['log_s'][drug_dur_mask]
-                    _y = batch_y_dur[drug_dur_mask].float().unsqueeze(-1)
-                    _z = (_y - _mu) / torch.exp(_ls)
-                    _log_pdf = -_z - _ls - 2.0 * torch.nn.functional.softplus(-_z)
-                    _log_pi = torch.nn.functional.log_softmax(_pi, dim=-1)
-                    _nll = -torch.logsumexp(_log_pi + _log_pdf, dim=-1)
-                    _nll = torch.clamp(_nll, min=0.0, max=50.0)
-                    mdn_nll_dur_sum += float(_nll.sum().item())
-                    mdn_nll_dur_count += int(_nll.numel())
+                total_pos = total_mask & (batch_y_total > 0)
+                if total_pos.any():
+                    tp_pos = total_pred[total_pos]
+                    tt_pos = batch_y_total[total_pos].float()
+                    all_predictions_pos['total'].append(torch.clamp(tp_pos, min=0.0).cpu().numpy())
+                    all_targets_pos['total'].append(tt_pos.cpu().numpy())
 
-    # Concatenate drug-token predictions
-    if len(all_predictions_dose) > 0:
-        all_predictions_dose = np.concatenate(all_predictions_dose)
-        all_targets_dose = np.concatenate(all_targets_dose)
+    # Concatenate all batches (skip empty)
+    for field in ['shift', 'total']:
+        if len(all_predictions[field]) > 0:
+            all_predictions[field] = np.concatenate(all_predictions[field])
+            all_targets[field] = np.concatenate(all_targets[field])
+        else:
+            all_predictions[field] = np.array([])
+            all_targets[field] = np.array([])
+
+    for field in ['total']:
+        if len(all_predictions_pos[field]) > 0:
+            all_predictions_pos[field] = np.concatenate(all_predictions_pos[field])
+            all_targets_pos[field] = np.concatenate(all_targets_pos[field])
+        else:
+            all_predictions_pos[field] = np.array([])
+            all_targets_pos[field] = np.array([])
+    
+    if len(all_shift_probs) > 0:
+        all_shift_probs = np.concatenate(all_shift_probs)
     else:
-        all_predictions_dose = np.array([])
-        all_targets_dose = np.array([])
+        all_shift_probs = np.array([])
 
-    if len(all_predictions_dur) > 0:
-        all_predictions_dur = np.concatenate(all_predictions_dur)
-        all_targets_dur = np.concatenate(all_targets_dur)
+    if len(all_predictions_shift_drug_cond) > 0:
+        all_predictions_shift_drug_cond = np.concatenate(all_predictions_shift_drug_cond)
+        all_targets_shift_drug_cond = np.concatenate(all_targets_shift_drug_cond)
+        all_shift_probs_drug_cond = np.concatenate(all_shift_probs_drug_cond)
     else:
-        all_predictions_dur = np.array([])
-        all_targets_dur = np.array([])
-
-    posthoc_calibration = str(posthoc_calibration).lower()
-    if posthoc_calibration not in {"none", "affine", "isotonic"}:
-        raise ValueError(f"Unknown posthoc_calibration: {posthoc_calibration}")
-
-    active_calibration_bundle = calibration_bundle
-    if active_calibration_bundle is None and posthoc_calibration in {"affine", "isotonic"}:
-        # Backward-compatible default: self-fit on current split unless an external bundle is supplied.
-        active_calibration_bundle = fit_posthoc_calibration_bundle(
-            posthoc_calibration,
-            dose_pred=all_predictions_dose.astype(np.float32),
-            dose_target=all_targets_dose.astype(np.float32),
-            dur_pred=all_predictions_dur.astype(np.float32),
-            dur_target=all_targets_dur.astype(np.float32),
-            fit_source=calibration_fit_source or "self",
-        )
-
-    active_calibration_method = "none"
-    if active_calibration_bundle is not None:
-        active_calibration_method = str(active_calibration_bundle.get("method", "none")).lower()
-
-    # Calculate metrics (drug-token only)
+        all_predictions_shift_drug_cond = np.array([])
+        all_targets_shift_drug_cond = np.array([])
+        all_shift_probs_drug_cond = np.array([])
+    
+    if len(all_predictions_total_drug_cond) > 0:
+        all_predictions_total_drug_cond = np.concatenate(all_predictions_total_drug_cond)
+        all_targets_total_drug_cond = np.concatenate(all_targets_total_drug_cond)
+    else:
+        all_predictions_total_drug_cond = np.array([])
+        all_targets_total_drug_cond = np.array([])
+    
+    # Calculate metrics
     results = {}
+    
+    # ============================================================
+    # SHIFT: CLASSIFICATION METRICS (supports 2 or 3 classes)
+    # ============================================================
+    def _shift_classification_metrics(targets, preds, n_classes, probs=None):
+        """Compute classification metrics for SHIFT. Returns a dict."""
+        class_labels = np.arange(n_classes)
+        if n_classes == 3:
+            class_name_map = {"0": "Decrease", "1": "Maintain", "2": "Increase"}
+        else:
+            class_name_map = {"0": "Label1", "1": "Label2or3"}
 
+        m = {}
+        m['accuracy'] = accuracy_score(targets, preds)
+        m['balanced_accuracy'] = balanced_accuracy_score(targets, preds)
+        m['f1_macro'] = f1_score(targets, preds, average='macro', zero_division=0)
+        m['f1_micro'] = f1_score(targets, preds, average='micro', zero_division=0)
+        m['f1_weighted'] = f1_score(targets, preds, average='weighted', zero_division=0)
+        m['precision_macro'] = precision_score(targets, preds, average='macro', zero_division=0)
+        m['recall_macro'] = recall_score(targets, preds, average='macro', zero_division=0)
+
+        # ROC AUC from softmax probabilities
+        if probs is not None and len(probs) > 0:
+            try:
+                if n_classes == 2:
+                    m['roc_auc'] = float(roc_auc_score(targets, probs[:, 1]))
+                else:
+                    m['roc_auc'] = float(roc_auc_score(targets, probs, multi_class='ovr'))
+            except (ValueError, IndexError):
+                m['roc_auc'] = float('nan')
+        m['support'] = int(len(targets))
+
+        cm = confusion_matrix(targets, preds, labels=class_labels)
+        m['confusion_matrix'] = cm.tolist()
+        m['confusion_matrix_classes'] = class_labels.tolist()
+        m['class_name_map'] = class_name_map
+
+        per_class = {}
+        for i, cls in enumerate(class_labels):
+            tp = cm[i, i]
+            fp = cm[:, i].sum() - tp
+            fn = cm[i, :].sum() - tp
+            prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            f1_c = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+            per_class[int(cls)] = {
+                'precision': float(prec), 'recall': float(rec),
+                'f1': float(f1_c), 'support': int(tp + fn)
+            }
+        m['per_class_metrics'] = per_class
+        return m
+
+    if len(all_targets['shift']) > 0:
+        shift_pred = all_predictions['shift']
+        shift_target = all_targets['shift']
+        n_classes = int(max(shift_target.max(), shift_pred.max())) + 1
+        n_classes = max(n_classes, 2)  # at least binary
+
+        shift_probs_arr = all_shift_probs if len(all_shift_probs) > 0 else None
+        shift_metrics = _shift_classification_metrics(shift_target, shift_pred, n_classes, probs=shift_probs_arr)
+        for k, v in shift_metrics.items():
+            results[f'shift_{k}'] = v
+
+        # Drug-conditioned SHIFT metrics (ONLY for drug tokens)
+        if len(all_predictions_shift_drug_cond) > 0:
+            n_classes_drug = int(max(all_targets_shift_drug_cond.max(), all_predictions_shift_drug_cond.max())) + 1
+            n_classes_drug = max(n_classes_drug, 2)
+            drug_probs_arr = all_shift_probs_drug_cond if len(all_shift_probs_drug_cond) > 0 else None
+            drug_metrics = _shift_classification_metrics(
+                all_targets_shift_drug_cond, all_predictions_shift_drug_cond, n_classes_drug, probs=drug_probs_arr
+            )
+            for k, v in drug_metrics.items():
+                results[f'shift_{k}_drug_cond'] = v
+            results['shift_drug_cond_note'] = drug_token_note
+    
     # ============================================================
-    # DOSE: REGRESSION METRICS (drug tokens only)
+    # TOTAL: REGRESSION METRICS
     # ============================================================
-    if len(all_predictions_dose) > 0:
-        dose_pred = all_predictions_dose.astype(np.float32)
-        dose_target = all_targets_dose.astype(np.float32)
-        results['dose_mae'] = mean_absolute_error(dose_target, dose_pred)
-        results['dose_rmse'] = float(np.sqrt(mean_squared_error(dose_target, dose_pred)))
-        results['dose_median_ae'] = float(np.median(np.abs(dose_target - dose_pred)))
+    for field in ['total']:
+        if len(all_targets[field]) == 0:
+            continue
+            
+        pred = all_predictions[field]  # continuous regression output
+        target = all_targets[field]    # continuous target
+        
+        # Regression metrics
+        mae = mean_absolute_error(target, pred)
+        rmse = np.sqrt(mean_squared_error(target, pred))
+        median_ae = np.median(np.abs(target - pred))
+        
+        # R² score
         try:
-            results['dose_r2'] = r2_score(dose_target, dose_pred)
-        except Exception:
-            results['dose_r2'] = np.nan
-        results['dose_mean_target'] = float(np.mean(dose_target))
-        results['dose_mean_pred'] = float(np.mean(dose_pred))
-        results['dose_support'] = int(len(dose_target))
+            r2 = r2_score(target, pred)
+        except:
+            r2 = np.nan
+        
+        results[f'{field}_mae'] = mae
+        results[f'{field}_rmse'] = rmse
+        results[f'{field}_median_ae'] = median_ae
+        results[f'{field}_r2'] = r2
+        
+        # Additional stats
+        results[f'{field}_mean_target'] = np.mean(target)
+        results[f'{field}_mean_pred'] = np.mean(pred)
+        results[f'{field}_std_target'] = np.std(target)
+        results[f'{field}_std_pred'] = np.std(pred)
 
-        if active_calibration_method in {'affine', 'isotonic'} and active_calibration_bundle is not None:
-            dose_cal_obj = active_calibration_bundle.get("dose", None)
-            if dose_cal_obj is not None:
-                dose_pred_cal = apply_posthoc_calibration_bundle(dose_pred, active_calibration_bundle, "dose")
-                results['dose_calibration'] = active_calibration_method
-                fit_source = str(active_calibration_bundle.get("fit_source", "")).strip()
-                if fit_source:
-                    results['dose_calibration_fit_source'] = fit_source
-                if active_calibration_method == 'affine':
-                    results['dose_calibration_a'] = float(dose_cal_obj['a'])
-                    results['dose_calibration_b'] = float(dose_cal_obj['b'])
-                elif active_calibration_method == 'isotonic':
-                    results['dose_calibration_n_knots'] = int(dose_cal_obj.get("n_knots", 0))
-                results['dose_mae_calibrated'] = mean_absolute_error(dose_target, dose_pred_cal)
-                results['dose_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dose_target, dose_pred_cal)))
-                try:
-                    results['dose_r2_calibrated'] = r2_score(dose_target, dose_pred_cal)
-                except Exception:
-                    results['dose_r2_calibrated'] = np.nan
-                results['dose_mean_pred_calibrated'] = float(np.mean(dose_pred_cal))
+        # Positive-only regression metrics (targets > 0)
+        if len(all_targets_pos[field]) > 0:
+            pred_pos = all_predictions_pos[field]
+            target_pos = all_targets_pos[field]
+            results[f'{field}_mae_pos'] = mean_absolute_error(target_pos, pred_pos)
+            results[f'{field}_rmse_pos'] = float(np.sqrt(mean_squared_error(target_pos, pred_pos)))
+            results[f'{field}_median_ae_pos'] = float(np.median(np.abs(target_pos - pred_pos)))
+            try:
+                results[f'{field}_r2_pos'] = r2_score(target_pos, pred_pos)
+            except:
+                results[f'{field}_r2_pos'] = np.nan
+            results[f'{field}_support_pos'] = int(len(target_pos))
 
-        # Optional interpretability metric for near-discrete targets.
-        dose_target_round = np.rint(dose_target)
-        frac_integer_target = float(np.mean(np.isclose(dose_target, dose_target_round, atol=1e-6)))
-        if frac_integer_target > 0.95:
-            dose_pred_rounded = np.rint(np.clip(dose_pred, dose_min_eval, dose_max_eval)).astype(np.int64)
-            dose_target_int = dose_target.astype(np.int64)
-            results['dose_rounded_accuracy'] = accuracy_score(dose_target_int, dose_pred_rounded)
-        results['dose_note'] = drug_token_note
-
-    # ============================================================
-    # DURATION: REGRESSION METRICS (drug tokens only)
-    # ============================================================
-    if len(all_predictions_dur) > 0:
-        dur_pred_arr = all_predictions_dur.astype(np.float32)
-        dur_target_arr = all_targets_dur.astype(np.float32)
-        results['dur_mae'] = mean_absolute_error(dur_target_arr, dur_pred_arr)
-        results['dur_rmse'] = float(np.sqrt(mean_squared_error(dur_target_arr, dur_pred_arr)))
-        results['dur_median_ae'] = float(np.median(np.abs(dur_target_arr - dur_pred_arr)))
+    # Drug-conditioned TOTAL metrics (ONLY for drug tokens)
+    if len(all_predictions_total_drug_cond) > 0:
+        pred_drug = all_predictions_total_drug_cond
+        tgt_drug = all_targets_total_drug_cond
+        results['total_mae_drug_cond'] = mean_absolute_error(tgt_drug, pred_drug)
+        results['total_rmse_drug_cond'] = float(np.sqrt(mean_squared_error(tgt_drug, pred_drug)))
+        results['total_median_ae_drug_cond'] = float(np.median(np.abs(tgt_drug - pred_drug)))
         try:
-            results['dur_r2'] = r2_score(dur_target_arr, dur_pred_arr)
-        except Exception:
-            results['dur_r2'] = np.nan
-        results['dur_mean_target'] = float(np.mean(dur_target_arr))
-        results['dur_mean_pred'] = float(np.mean(dur_pred_arr))
-        results['dur_support'] = int(len(dur_target_arr))
-
-        if active_calibration_method in {'affine', 'isotonic'} and active_calibration_bundle is not None:
-            dur_cal_obj = active_calibration_bundle.get("dur", None)
-            if dur_cal_obj is not None:
-                dur_pred_cal = apply_posthoc_calibration_bundle(dur_pred_arr, active_calibration_bundle, "dur")
-                results['dur_calibration'] = active_calibration_method
-                fit_source = str(active_calibration_bundle.get("fit_source", "")).strip()
-                if fit_source:
-                    results['dur_calibration_fit_source'] = fit_source
-                if active_calibration_method == 'affine':
-                    results['dur_calibration_a'] = float(dur_cal_obj['a'])
-                    results['dur_calibration_b'] = float(dur_cal_obj['b'])
-                elif active_calibration_method == 'isotonic':
-                    results['dur_calibration_n_knots'] = int(dur_cal_obj.get("n_knots", 0))
-                results['dur_mae_calibrated'] = mean_absolute_error(dur_target_arr, dur_pred_cal)
-                results['dur_rmse_calibrated'] = float(np.sqrt(mean_squared_error(dur_target_arr, dur_pred_cal)))
-                try:
-                    results['dur_r2_calibrated'] = r2_score(dur_target_arr, dur_pred_cal)
-                except Exception:
-                    results['dur_r2_calibrated'] = np.nan
-                results['dur_mean_pred_calibrated'] = float(np.mean(dur_pred_cal))
-        results['dur_note'] = drug_token_note
-
-    # ============================================================
-    # MDN NLL METRICS (drug tokens only)
-    # ============================================================
-    if mdn_nll_dose_count > 0:
-        results['dose_mdn_nll'] = mdn_nll_dose_sum / mdn_nll_dose_count
-        results['dose_mdn_nll_support'] = mdn_nll_dose_count
-    if mdn_nll_dur_count > 0:
-        results['dur_mdn_nll'] = mdn_nll_dur_sum / mdn_nll_dur_count
-        results['dur_mdn_nll_support'] = mdn_nll_dur_count
-
-    if return_calibration_bundle:
-        return results, active_calibration_bundle
+            results['total_r2_drug_cond'] = r2_score(tgt_drug, pred_drug)
+        except:
+            results['total_r2_drug_cond'] = np.nan
+        results['total_mean_target_drug_cond'] = float(np.mean(tgt_drug))
+        results['total_mean_pred_drug_cond'] = float(np.mean(pred_drug))
+        results['total_support_drug_cond'] = int(len(tgt_drug))
+        results['total_drug_cond_note'] = drug_token_note
+    
     return results
 
 
@@ -865,11 +787,6 @@ def evaluate_auc_pipeline(
     n_bootstrap=1,
     meta_info={},
     train_valid_tokens=None,  # Set of tokens present in train data (for filtering)
-    posthoc_calibration='none',
-    calibration_bundle=None,
-    fit_calibration_on_this_split=False,
-    calibration_fit_source='',
-    return_calibration_bundle=False,
 ):
     """
     Runs the AUC evaluation pipeline.
@@ -881,7 +798,7 @@ def evaluate_auc_pipeline(
         output_path (str | None): Directory where CSV files will be written. If None, files will not be saved.
         model_type (str): must be 'composite'
         diseases_of_interest (np.ndarray or list, optional): If provided, these disease indices are used.
-        filter_min_total (int): Minimum dur token count to include a token.
+        filter_min_total (int): Minimum total token count to include a token.
         disease_chunk_size (int): Maximum chunk size for processing diseases.
         age_groups (np.ndarray): Age groups to use in calibration.
         offset (float): Offset used in get_calibration_auc.
@@ -906,7 +823,7 @@ def evaluate_auc_pipeline(
     
     # Adjust vocab_size if labels indicate more tokens (e.g., Death token at 1289)
     # Note: labels_df indices are 0-based and represent raw data values.
-    # If max index is 1288 (Death raw), after +1 dose max token is 1289.
+    # If max index is 1288 (Death raw), after +1 shift max token is 1289.
     # We need vocab_size > 1289 (i.e. >= 1290) to include it.
     # Use model's vocab_size (trust the model config)
     vocab_size = config_vocab_size
@@ -933,7 +850,7 @@ def evaluate_auc_pipeline(
     # CRITICAL: Filter to only include tokens that actually exist in the evaluation data
     # This prevents evaluating tokens like SGLT-2 or Other that may not exist in val/test data
     target_data_np = d100k[4].cpu().detach().numpy()  # y_data (target DATA tokens)
-    # d100k = (x_data, x_dose, x_dur, x_ages, y_data, y_dose, y_dur, y_ages)
+    # d100k = (x_data, x_shift, x_total, x_ages, y_data, y_shift, y_total, y_ages)
     
     actual_tokens_in_data = set(np.unique(target_data_np).tolist())
     # Remove invalid tokens like -1 (padding)
@@ -978,12 +895,8 @@ def evaluate_auc_pipeline(
     pred_idx_precompute = (d[1][:, :, np.newaxis] <= d[3][:, np.newaxis, :] - offset).sum(1) - 1
 
     all_aucs = []
-    # Keep internal option name "duration", but adapt to tqdm's accepted key "total".
-    tqdm_options = {"desc": "Processing disease chunks", "duration": len(diseases_chunks)}
-    tqdm_kwargs = dict(tqdm_options)
-    if "duration" in tqdm_kwargs and "total" not in tqdm_kwargs:
-        tqdm_kwargs["total"] = tqdm_kwargs.pop("duration")
-    for disease_chunk_idx, diseases_chunk in tqdm(enumerate(diseases_chunks), **tqdm_kwargs):
+    tqdm_options = {"desc": "Processing disease chunks", "total": len(diseases_chunks)}
+    for disease_chunk_idx, diseases_chunk in tqdm(enumerate(diseases_chunks), **tqdm_options):
         # Filter out invalid indices for this chunk
         diseases_chunk = np.array(diseases_chunk)
         valid_mask = (diseases_chunk >= 0) & (diseases_chunk < vocab_size)
@@ -998,19 +911,19 @@ def evaluate_auc_pipeline(
         model.eval()
         with torch.no_grad():
             # Process the evaluation data in batches
-            x_data, x_dose, x_dur, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
+            x_data, x_shift, x_total, x_ages = d100k[0], d100k[1], d100k[2], d100k[3]
             num_batches = (x_data.shape[0] + batch_size - 1) // batch_size
             for batch_idx in tqdm(range(num_batches), desc=f"Model inference, chunk {disease_chunk_idx}"):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, x_data.shape[0])
 
                 batch_x_data = x_data[start_idx:end_idx].to(device)
-                batch_x_dose = x_dose[start_idx:end_idx].to(device)
-                batch_x_dur = x_dur[start_idx:end_idx].to(device)
+                batch_x_shift = x_shift[start_idx:end_idx].to(device)
+                batch_x_total = x_total[start_idx:end_idx].to(device)
                 batch_x_ages = x_ages[start_idx:end_idx].to(device)
 
                 outputs = model(
-                    batch_x_data, batch_x_dose, batch_x_dur, batch_x_ages
+                    batch_x_data, batch_x_shift, batch_x_total, batch_x_ages
                 )[0]  # Get logits dict
 
                 data_logits = outputs['data'].cpu().detach().numpy()
@@ -1063,6 +976,7 @@ def evaluate_auc_pipeline(
         )
     else:
         df_auc_unpooled_merged = df_auc_unpooled.copy()
+    df_auc_unpooled_merged = finalize_token_columns(df_auc_unpooled_merged)
 
     def aggregate_age_brackets_delong(group):
         # For normal distributions, when averaging n of them:
@@ -1111,91 +1025,133 @@ def evaluate_auc_pipeline(
         df_auc_merged = df_auc.merge(labels_df_for_merge, left_on="token", right_on="shifted_token", how="inner")
     else:
         df_auc_merged = df_auc.copy()
+    df_auc_merged = finalize_token_columns(df_auc_merged)
     
-    # Evaluate composite fields (DOSE, DURATION) if composite model and enabled
+    # Evaluate composite fields (SHIFT, TOTAL) if composite model and enabled
     composite_metrics = None
-    fitted_calibration_bundle = None
     if evaluate_composite:
-        print("\nEvaluating composite fields (DOSE, DURATION)...")
-        composite_eval_out = evaluate_composite_fields(
-            model,
-            d100k,
-            batch_size=batch_size,
-            device=device,
-            posthoc_calibration=posthoc_calibration,
-            calibration_bundle=calibration_bundle,
-            fit_calibration=fit_calibration_on_this_split,
-            calibration_fit_source=calibration_fit_source,
-            return_calibration_bundle=return_calibration_bundle,
+        print("\nEvaluating composite fields (SHIFT-binary-change, TOTAL)...")
+        composite_metrics = evaluate_composite_fields(
+            model, d100k, batch_size=batch_size, device=device
         )
-        if return_calibration_bundle:
-            composite_metrics, fitted_calibration_bundle = composite_eval_out
-        else:
-            composite_metrics = composite_eval_out
-            fitted_calibration_bundle = None
         
         # Print results
         print("\nComposite Field Evaluation Results:")
         print("=" * 60)
-
-        # DOSE regression metrics
-        if 'dose_mae' in composite_metrics:
-            print("DOSE:")
-            print(f"  MAE: {composite_metrics['dose_mae']:.4f}")
-            if 'dose_rmse' in composite_metrics:
-                print(f"  RMSE: {composite_metrics['dose_rmse']:.4f}")
-            if 'dose_median_ae' in composite_metrics:
-                print(f"  Median AE: {composite_metrics['dose_median_ae']:.4f}")
-            if 'dose_r2' in composite_metrics and not np.isnan(composite_metrics['dose_r2']):
-                print(f"  R²: {composite_metrics['dose_r2']:.4f}")
-            if 'dose_rounded_accuracy' in composite_metrics:
-                print(f"  Rounded Accuracy: {composite_metrics['dose_rounded_accuracy']:.4f}")
-            if 'dose_mean_target' in composite_metrics:
-                print(f"  Mean Target: {composite_metrics['dose_mean_target']:.4f}")
-            if 'dose_mean_pred' in composite_metrics:
-                print(f"  Mean Prediction: {composite_metrics['dose_mean_pred']:.4f}")
-            if 'dose_support' in composite_metrics:
-                print(f"  Support: {composite_metrics['dose_support']}")
-            if 'dose_mae_calibrated' in composite_metrics:
-                print(f"  MAE (calibrated): {composite_metrics['dose_mae_calibrated']:.4f}")
-                print(f"  RMSE (calibrated): {composite_metrics['dose_rmse_calibrated']:.4f}")
-                if 'dose_r2_calibrated' in composite_metrics and not np.isnan(composite_metrics['dose_r2_calibrated']):
-                    print(f"  R² (calibrated): {composite_metrics['dose_r2_calibrated']:.4f}")
-        else:
-            print("DOSE: n/a")
-
-        # DURATION regression metrics
-        if 'dur_mae' in composite_metrics:
-            print("DURATION:")
-            print(f"  MAE: {composite_metrics['dur_mae']:.4f}")
-            if 'dur_rmse' in composite_metrics:
-                print(f"  RMSE: {composite_metrics['dur_rmse']:.4f}")
-            if 'dur_median_ae' in composite_metrics:
-                print(f"  Median AE: {composite_metrics['dur_median_ae']:.4f}")
-            if 'dur_r2' in composite_metrics and not np.isnan(composite_metrics['dur_r2']):
-                print(f"  R²: {composite_metrics['dur_r2']:.4f}")
-            if 'dur_mean_target' in composite_metrics:
-                print(f"  Mean Target: {composite_metrics['dur_mean_target']:.4f}")
-            if 'dur_mean_pred' in composite_metrics:
-                print(f"  Mean Prediction: {composite_metrics['dur_mean_pred']:.4f}")
-            if 'dur_support' in composite_metrics:
-                print(f"  Support: {composite_metrics['dur_support']}")
-            if 'dur_mae_calibrated' in composite_metrics:
-                print(f"  MAE (calibrated): {composite_metrics['dur_mae_calibrated']:.4f}")
-                print(f"  RMSE (calibrated): {composite_metrics['dur_rmse_calibrated']:.4f}")
-                if 'dur_r2_calibrated' in composite_metrics and not np.isnan(composite_metrics['dur_r2_calibrated']):
-                    print(f"  R² (calibrated): {composite_metrics['dur_r2_calibrated']:.4f}")
-        else:
-            print("DURATION: n/a")
-
-        # MDN NLL metrics
-        has_any_nll = any(k in composite_metrics for k in ['dose_mdn_nll', 'dur_mdn_nll'])
-        if has_any_nll:
-            print("\nMDN NLL (lower = better):")
-            if 'dose_mdn_nll' in composite_metrics:
-                print(f"  DOSE: {composite_metrics['dose_mdn_nll']:.4f} (n={composite_metrics.get('dose_mdn_nll_support', 'NA')})")
-            if 'dur_mdn_nll' in composite_metrics:
-                print(f"  DURATION: {composite_metrics['dur_mdn_nll']:.4f} (n={composite_metrics.get('dur_mdn_nll_support', 'NA')})")
+        
+        # SHIFT: classification
+        if 'shift_accuracy' in composite_metrics:
+            print("SHIFT (Binary: Label1 vs Label2or3):")
+            print(f"  Accuracy: {composite_metrics['shift_accuracy']:.4f}")
+            if 'shift_balanced_accuracy' in composite_metrics:
+                print(f"  Balanced Accuracy: {composite_metrics['shift_balanced_accuracy']:.4f}")
+            if 'shift_f1_macro' in composite_metrics:
+                print(f"  F1 (macro): {composite_metrics['shift_f1_macro']:.4f}")
+            if 'shift_f1_micro' in composite_metrics:
+                print(f"  F1 (micro): {composite_metrics['shift_f1_micro']:.4f}")
+            if 'shift_f1_weighted' in composite_metrics:
+                print(f"  F1 (weighted): {composite_metrics['shift_f1_weighted']:.4f}")
+            if 'shift_precision_macro' in composite_metrics:
+                print(f"  Precision (macro): {composite_metrics['shift_precision_macro']:.4f}")
+            if 'shift_recall_macro' in composite_metrics:
+                print(f"  Recall (macro): {composite_metrics['shift_recall_macro']:.4f}")
+            if 'shift_support' in composite_metrics:
+                print(f"  Support: {composite_metrics['shift_support']}")
+            
+            # Confusion Matrix
+            if 'shift_confusion_matrix' in composite_metrics and 'shift_confusion_matrix_classes' in composite_metrics:
+                cm = np.array(composite_metrics['shift_confusion_matrix'])
+                classes = composite_metrics['shift_confusion_matrix_classes']
+                print(f"\n  Confusion Matrix:")
+                print(f"    NOTE: Classes are 0=Label1, 1=Label2or3")
+                print(f"    Predicted →")
+                # Header row with mapping
+                header = "    Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes])
+                print(header)
+                print("    " + "-" * len(header[4:]))
+                # Data rows
+                for i, cls in enumerate(classes):
+                    row_str = f"    {int(cls):>5} " + "  ".join([f"{int(cm[i, j]):>5}" for j in range(len(classes))])
+                    print(row_str)
+                
+                # Per-class metrics with mapping
+                if 'shift_per_class_metrics' in composite_metrics:
+                    print(f"\n  Per-Class Metrics:")
+                    for cls, metrics in sorted(composite_metrics['shift_per_class_metrics'].items()):
+                        print(f"    Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
+                              f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
+            
+            # Drug-conditioned SHIFT metrics (ONLY for configured drug token range)
+            if 'shift_accuracy_drug_cond' in composite_metrics:
+                shift_drug_note = composite_metrics.get('shift_drug_cond_note', 'Metrics computed only for configured drug token range')
+                print(f"\n  Drug-Conditioned ({shift_drug_note}):")
+                print(f"    Accuracy: {composite_metrics['shift_accuracy_drug_cond']:.4f}")
+                if 'shift_balanced_accuracy_drug_cond' in composite_metrics:
+                    print(f"    Balanced Accuracy: {composite_metrics['shift_balanced_accuracy_drug_cond']:.4f}")
+                if 'shift_f1_macro_drug_cond' in composite_metrics:
+                    print(f"    F1 (macro): {composite_metrics['shift_f1_macro_drug_cond']:.4f}")
+                if 'shift_f1_micro_drug_cond' in composite_metrics:
+                    print(f"    F1 (micro): {composite_metrics['shift_f1_micro_drug_cond']:.4f}")
+                if 'shift_f1_weighted_drug_cond' in composite_metrics:
+                    print(f"    F1 (weighted): {composite_metrics['shift_f1_weighted_drug_cond']:.4f}")
+                if 'shift_precision_macro_drug_cond' in composite_metrics:
+                    print(f"    Precision (macro): {composite_metrics['shift_precision_macro_drug_cond']:.4f}")
+                if 'shift_recall_macro_drug_cond' in composite_metrics:
+                    print(f"    Recall (macro): {composite_metrics['shift_recall_macro_drug_cond']:.4f}")
+                if 'shift_support_drug_cond' in composite_metrics:
+                    print(f"    Support: {composite_metrics['shift_support_drug_cond']}")
+                
+                # Drug-conditioned confusion matrix
+                if 'shift_confusion_matrix_drug_cond' in composite_metrics and 'shift_confusion_matrix_drug_cond_classes' in composite_metrics:
+                    cm_drug = np.array(composite_metrics['shift_confusion_matrix_drug_cond'])
+                    classes_drug = composite_metrics['shift_confusion_matrix_drug_cond_classes']
+                    print(f"\n    Confusion Matrix (Drug-Conditioned, Drug Tokens Only):")
+                    print(f"      NOTE: Classes are 0=Label1, 1=Label2or3")
+                    print(f"      Predicted →")
+                    header = "      Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes_drug])
+                    print(header)
+                    print("      " + "-" * len(header[6:]))
+                    for i, cls in enumerate(classes_drug):
+                        row_str = f"      {int(cls):>5} " + "  ".join([f"{int(cm_drug[i, j]):>5}" for j in range(len(classes_drug))])
+                        print(row_str)
+                    
+                    # Per-class metrics for drug-conditioned
+                    if 'shift_per_class_metrics_drug_cond' in composite_metrics:
+                        print(f"\n    Per-Class Metrics (Drug-Conditioned):")
+                        for cls, metrics in sorted(composite_metrics['shift_per_class_metrics_drug_cond'].items()):
+                            print(f"      Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
+                                  f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
+        
+        # TOTAL: regression
+        field = 'total'
+        if f'{field}_mae' in composite_metrics:
+            print(f"{field.upper()}:")
+            print(f"  MAE: {composite_metrics[f'{field}_mae']:.4f}")
+            if f'{field}_rmse' in composite_metrics:
+                print(f"  RMSE: {composite_metrics[f'{field}_rmse']:.4f}")
+            if f'{field}_median_ae' in composite_metrics:
+                print(f"  Median AE: {composite_metrics[f'{field}_median_ae']:.4f}")
+            if f'{field}_r2' in composite_metrics and not np.isnan(composite_metrics[f'{field}_r2']):
+                print(f"  R²: {composite_metrics[f'{field}_r2']:.4f}")
+            if f'{field}_mae_pos' in composite_metrics:
+                print(f"  MAE (target>0): {composite_metrics[f'{field}_mae_pos']:.4f} (n={composite_metrics.get(f'{field}_support_pos', 'NA')})")
+            # TOTAL drug-conditioned extras (ONLY for configured drug token range)
+            if 'total_mae_drug_cond' in composite_metrics:
+                total_drug_note = composite_metrics.get('total_drug_cond_note', 'Metrics computed only for configured drug token range')
+                print(f"\n  Drug-Conditioned ({total_drug_note}):")
+                print(f"    MAE: {composite_metrics['total_mae_drug_cond']:.4f}")
+                if 'total_rmse_drug_cond' in composite_metrics:
+                    print(f"    RMSE: {composite_metrics['total_rmse_drug_cond']:.4f}")
+                if 'total_median_ae_drug_cond' in composite_metrics:
+                    print(f"    Median AE: {composite_metrics['total_median_ae_drug_cond']:.4f}")
+                if 'total_r2_drug_cond' in composite_metrics and not np.isnan(composite_metrics['total_r2_drug_cond']):
+                    print(f"    R²: {composite_metrics['total_r2_drug_cond']:.4f}")
+                if 'total_mean_target_drug_cond' in composite_metrics:
+                    print(f"    Mean Target: {composite_metrics['total_mean_target_drug_cond']:.4f}")
+                if 'total_mean_pred_drug_cond' in composite_metrics:
+                    print(f"    Mean Prediction: {composite_metrics['total_mean_pred_drug_cond']:.4f}")
+                if 'total_support_drug_cond' in composite_metrics:
+                    print(f"    Support: {composite_metrics['total_support_drug_cond']}")
         print("=" * 60)
         
         # Save composite metrics
@@ -1229,20 +1185,13 @@ def evaluate_auc_pipeline(
         df_auc_merged.to_parquet(f"{output_path}/df_both.parquet", index=False)
         df_auc_unpooled_merged.to_parquet(f"{output_path}/df_auc_unpooled.parquet", index=False)
 
-    if return_calibration_bundle:
-        return df_auc_unpooled_merged, df_auc_merged, composite_metrics, fitted_calibration_bundle
     return df_auc_unpooled_merged, df_auc_merged, composite_metrics
 
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate AUC")
     parser.add_argument("--input_path", type=str, default="../data", help="Path to the dataset")
-    parser.add_argument(
-        "--output_path",
-        type=str,
-        default=None,
-        help="Path to the output. If omitted or set to 'auto', use the checkpoint directory.",
-    )
+    parser.add_argument("--output_path", type=str, default="results", help="Path to the output")
     parser.add_argument("--model_ckpt_path", type=str, required=True, help="Path to the model weights")
     parser.add_argument("--model_type", type=str, default='composite', choices=['composite'],
                         help="Model type (composite only)")
@@ -1253,26 +1202,15 @@ def main():
     parser.add_argument("--dataset_subset_size", type=int, default=10000, help="Dataset subset size for evaluation (-1 for all)")
     parser.add_argument("--n_bootstrap", type=int, default=1, help="Number of bootstrap samples")
     # Optional filtering/chunking parameters:
-    parser.add_argument("--filter_min_total", type=int, default=0, help="Minimum dur count to filter tokens (0=include all)")
+    parser.add_argument("--filter_min_total", type=int, default=0, help="Minimum total count to filter tokens (0=include all)")
     parser.add_argument("--disease_chunk_size", type=int, default=200, help="Chunk size for processing diseases")
     parser.add_argument("--labels_path", type=str, default=None, help="Path to labels CSV file")
-    parser.add_argument("--block_size", type=int, default=80, help="Block size for data loading")
+    parser.add_argument("--block_size", type=int, default=512, help="Block size for data loading")
     parser.add_argument("--eval_batch_size", type=int, default=64, help="Batch size for model inference during evaluation")
     parser.add_argument("--data_files", type=str, default=None, 
                         help="Comma-separated list of data files to evaluate (e.g., 'kr_val.bin,kr_test.bin'). If None, evaluates all: kr_val.bin, kr_test.bin, JMDC_extval.bin, UKB_extval.bin")
-    parser.add_argument("--train_data_file", type=str, default="dose/kr_train.bin",
+    parser.add_argument("--train_data_file", type=str, default="kr_train.bin",
                         help="Train data file to filter valid tokens. Only tokens present in train data will be evaluated.")
-    parser.add_argument("--posthoc_calibration", type=str, default="none", choices=["none", "affine", "isotonic"],
-                        help="Optional post-hoc calibration for regression outputs.")
-    parser.add_argument(
-        "--calibration_fit_prefix",
-        type=str,
-        default="",
-        help=(
-            "When set (e.g., 'val') and posthoc_calibration!=none, fit calibration only on this split "
-            "and apply it to other splits. Empty = per-split self-fit (legacy behavior)."
-        ),
-    )
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -1280,12 +1218,18 @@ def main():
     model_type = args.model_type
     no_event_token_rate = args.no_event_token_rate
     dataset_subset_size = args.dataset_subset_size
-    ckpt_path = args.model_ckpt_path
-    calibration_fit_prefix = str(args.calibration_fit_prefix).strip().lower()
 
-    # Resolve output path: default to checkpoint directory.
-    if output_path is None or str(output_path).strip() == "" or str(output_path).lower() == "auto":
-        output_path = str(Path(ckpt_path).resolve().parent)
+    # Auto-derive output_path from ckpt path: out/MMDD/HHMM/ckpt.pt -> results/MMDD/HHMM
+    if output_path == "results" and args.model_ckpt_path:
+        ckpt_dir = str(Path(args.model_ckpt_path).parent)
+        parts = ckpt_dir.replace("\\", "/").split("/")
+        try:
+            out_idx = parts.index("out")
+            sub_parts = parts[out_idx + 1:]
+            if sub_parts:
+                output_path = str(Path("results") / Path(*sub_parts))
+        except ValueError:
+            pass
 
     # Create output folder if it doesn't exist.
     if output_path is not None:
@@ -1296,27 +1240,18 @@ def main():
     seed = 1337
 
     # Load model checkpoint and initialize model.
+    ckpt_path = args.model_ckpt_path
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = dict(checkpoint["model_args"])
     eval_apply_token_shift = bool(model_args.get('apply_token_shift', False))
-    eval_separate_dose_na = bool(model_args.get('separate_dose_na_from_padding', False))
-    eval_dose_na_raw_token = int(model_args.get('dose_na_raw_token', 4))
-    eval_dose_continuous = bool(model_args.get('dose_continuous', False))
-    eval_dose_log = bool(model_args.get('dose_log', False))
-    eval_dose_log_transform_legacy = bool(model_args.get('dose_log_transform', False))
-    eval_dose_min = float(model_args.get('dose_min_value', -1.0))
-    eval_dose_max = float(model_args.get('dose_max_value', -1.0))
-    eval_dose_input_scale = float(model_args.get('dose_input_scale', 1.0))
-    print(f"apply_token_shift from checkpoint: {eval_apply_token_shift}")
-    print(f"separate_dose_na_from_padding from checkpoint: {eval_separate_dose_na}")
-    print(f"dose_continuous from checkpoint: {eval_dose_continuous}")
-    print(f"dose_log from checkpoint: {eval_dose_log}")
-    print(f"dose_log_transform (legacy) from checkpoint: {eval_dose_log_transform_legacy}")
-    print(f"dose_range from checkpoint: [{eval_dose_min}, {eval_dose_max}]")
-    print(f"dose_input_scale from checkpoint: {eval_dose_input_scale}")
-    if eval_dose_continuous and eval_separate_dose_na:
-        print("[fix] dose_continuous=True -> forcing separate_dose_na_from_padding=False for evaluation")
-        eval_separate_dose_na = False
+    eval_separate_shift_na = bool(model_args.get('separate_shift_na_from_padding', False))
+    eval_shift_na_raw_token = int(model_args.get('shift_na_raw_token', 4))
+    _eval_drug_min = int(model_args.get('drug_token_min', 1279 if eval_apply_token_shift else 1278))
+    _eval_drug_max = int(model_args.get('drug_token_max', 1289 if eval_apply_token_shift else 1288))
+    _space = "SHIFTED (+1)" if eval_apply_token_shift else "RAW"
+    print(f"Token space: {_space} (apply_token_shift={eval_apply_token_shift}) | "
+          f"Drug range: {_eval_drug_min}-{_eval_drug_max} | Death={_eval_drug_max}")
+    print(f"separate_shift_na_from_padding from checkpoint: {eval_separate_shift_na}")
     if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
         model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
         model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288
@@ -1325,21 +1260,46 @@ def main():
             f"[{model_args['drug_token_min']}, {model_args['drug_token_max']}] "
             f"(apply_token_shift={eval_apply_token_shift})."
         )
-    
-    # Extract MoE and other architecture info for metadata
-    use_moe = model_args.get('use_moe', False)
-    num_experts = model_args.get('num_experts', 0)
-    experts_per_token = model_args.get('experts_per_token', 0)
-    
-    conf = CompositeDelphiConfig(**model_args)
-    model = CompositeDelphi(conf)
-    
+
     state_dict = checkpoint["model"]
     # Strip DDP 'module.' or torch.compile '_orig_mod.' prefixes if present
     cleaned = {}
     for k, v in state_dict.items():
         k = k.replace('module.', '').replace('_orig_mod.', '')
         cleaned[k] = v
+
+    def infer_intermediate_size(cleaned_state_dict, use_moe):
+        if use_moe:
+            proj_key = 'h.0.mlp.experts.0.c_proj.weight'
+            fc_key = 'h.0.mlp.experts.0.c_fc.weight'
+        else:
+            proj_key = 'h.0.mlp.c_proj.weight'
+            fc_key = 'h.0.mlp.c_fc.weight'
+
+        if proj_key in cleaned_state_dict and cleaned_state_dict[proj_key].ndim == 2:
+            return int(cleaned_state_dict[proj_key].shape[1])
+        if fc_key in cleaned_state_dict and cleaned_state_dict[fc_key].ndim == 2:
+            return int(cleaned_state_dict[fc_key].shape[0] // 2)
+        return None
+
+    use_moe = bool(model_args.get('use_moe', False))
+    inferred_size = infer_intermediate_size(cleaned, use_moe=use_moe)
+    if use_moe and inferred_size is not None:
+        model_args['moe_intermediate_size'] = inferred_size
+        print(f"Inferred MoE intermediate size from checkpoint: {inferred_size}")
+    elif not use_moe and inferred_size is not None:
+        model_args['ffn_intermediate_size'] = inferred_size
+        print(f"Inferred FFN intermediate size from checkpoint: {inferred_size}")
+
+    # Extract MoE and other architecture info for metadata
+    num_experts = model_args.get('num_experts', 0)
+    experts_per_token = model_args.get('experts_per_token', 0)
+    
+    import dataclasses
+    valid_fields = {f.name for f in dataclasses.fields(CompositeDelphiConfig)}
+    model_args = {k: v for k, v in model_args.items() if k in valid_fields}
+    conf = CompositeDelphiConfig(**model_args)
+    model = CompositeDelphi(conf)
     model.load_state_dict(cleaned)
     model.eval()
     model = model.to(device)
@@ -1353,12 +1313,6 @@ def main():
         print(f"  Number of experts: {num_experts}")
         print(f"  Experts per token: {experts_per_token}")
     print(f"  Parameters: {model.get_num_params()/1e6:.2f}M")
-    print(f"  Post-hoc calibration: {args.posthoc_calibration}")
-    if str(args.posthoc_calibration).lower() != "none":
-        if calibration_fit_prefix:
-            print(f"  Calibration fit split: {calibration_fit_prefix} (apply-only on other splits)")
-        else:
-            print("  Calibration fit split: each split (self-fit)")
     print(f"{'='*60}\n")
 
     # Load labels (external) to be passed in.
@@ -1405,9 +1359,9 @@ def main():
     else:
         # Default: evaluate all files (internal val/test + external validations)
         data_files_list = [
-            ("dose/kr_val.bin", "val"),
-            ("dose/kr_test.bin", "test"),
-            ("dose/JMDC_extval.bin", "extval_jmdc"),
+            ("kr_val.bin", "val"),
+            ("kr_test.bin", "test"),
+            ("JMDC_extval.bin", "extval_jmdc"),
             ("UKB_extval.bin", "extval_ukb"),
         ]
     
@@ -1428,17 +1382,17 @@ def main():
 
     # Define dtype for composite data
     # IMPORTANT: Must match train_model.py exactly!
-    # Format: (ID, AGE, DATA, DOSE, DURATION)
+    # Format: (ID, AGE, DATA, SHIFT, TOTAL) - NO DOSE, NO UNIT
     composite_dtype = np.dtype([
         ('ID', np.uint32),
         ('AGE', np.uint32),
         ('DATA', np.uint32),
-        ('DOSE', np.float32),
-        ('DURATION', np.uint32)
+        ('SHIFT', np.uint32),
+        ('TOTAL', np.uint32)
     ])
     
     # ============================================================
-    # DIAGNOSTIC: Check DOSE values in raw data (before +1 dose)
+    # DIAGNOSTIC: Check SHIFT values in raw data (before +1 shift)
     # Only run for first data file to avoid spam
     # ============================================================
     diagnostic_run = False
@@ -1464,7 +1418,7 @@ def main():
 
         print(f"  Train data contains {len(train_valid_tokens)} unique tokens ({token_shift_note})")
         
-        # Show which drug tokens are in train (token ids depend on apply_token_shift)
+        # Show which drug tokens are in train
         base_drug_token = 1279 if eval_apply_token_shift else 1278
         drug_token_names = {
             base_drug_token + 0: 'Metformin',
@@ -1489,7 +1443,6 @@ def main():
 
     # Process each data file
     all_results = {}
-    shared_calibration_bundle = None
     for data_filename, prefix in data_files_list:
         data_filepath = f"{input_path}/{data_filename}"
         
@@ -1515,7 +1468,7 @@ def main():
         else:
             current_subset_size = min(current_subset_size, len(data_p2i))
         
-        print(f"Using {current_subset_size} patients for evaluation (out of {len(data_p2i)} dur)")
+        print(f"Using {current_subset_size} patients for evaluation (out of {len(data_p2i)} total)")
         
         # Sample random patients for evaluation
         np.random.seed(seed)
@@ -1533,42 +1486,14 @@ def main():
             padding="random",
             no_event_token_rate=no_event_token_rate,
             apply_token_shift=eval_apply_token_shift,
-            dose_continuous=eval_dose_continuous,
-            separate_dose_na_from_padding=(eval_separate_dose_na and not eval_dose_continuous),
-            dose_na_raw_token=eval_dose_na_raw_token,
+            separate_shift_na_from_padding=eval_separate_shift_na,
+            shift_na_raw_token=eval_shift_na_raw_token,
         )
         
         # Prepare meta info with data source
         meta_info = base_meta_info.copy()
         meta_info['data_source'] = data_filename
         meta_info['data_prefix'] = prefix
-
-        # Calibration protocol:
-        # - calibration_fit_prefix set: fit once on that split, apply-only on others
-        # - calibration_fit_prefix empty: legacy self-fit per split
-        split_prefix = str(prefix).strip().lower()
-        use_composite_eval = (prefix != 'extval_ukb')
-        use_posthoc = (str(args.posthoc_calibration).lower() != 'none') and use_composite_eval
-        fit_calibration_on_this_split = False
-        calibration_bundle_for_split = None
-        calibration_fit_source = ""
-        posthoc_calibration_for_split = args.posthoc_calibration
-        if use_posthoc:
-            if calibration_fit_prefix:
-                if split_prefix == calibration_fit_prefix:
-                    fit_calibration_on_this_split = True
-                    calibration_fit_source = split_prefix
-                elif shared_calibration_bundle is not None:
-                    calibration_bundle_for_split = shared_calibration_bundle
-                else:
-                    print(
-                        f"[calibration] fit split='{calibration_fit_prefix}' has not run yet; "
-                        f"running '{split_prefix}' without calibration."
-                    )
-                    posthoc_calibration_for_split = "none"
-            else:
-                fit_calibration_on_this_split = True
-                calibration_fit_source = split_prefix
         
         # Call the internal evaluation function (don't save files yet - we'll save with prefix)
         result = evaluate_auc_pipeline(
@@ -1577,8 +1502,8 @@ def main():
             output_path=None,  # Don't save internally, we'll save with prefix
             labels_df=labels_df,
             model_type=model_type,
-            # UKB external validation: only AUC is needed (skip DOSE/DURATION)
-            evaluate_composite=use_composite_eval,
+            # UKB external validation: only AUC is needed (skip SHIFT/TOTAL)
+            evaluate_composite=(prefix != 'extval_ukb'),
             diseases_of_interest=None,
             filter_min_total=args.filter_min_total,
             disease_chunk_size=args.disease_chunk_size,
@@ -1587,22 +1512,10 @@ def main():
             seed=seed,
             n_bootstrap=args.n_bootstrap,
             meta_info=meta_info,
-            train_valid_tokens=train_valid_tokens,
-            posthoc_calibration=posthoc_calibration_for_split,
-            calibration_bundle=calibration_bundle_for_split,
-            fit_calibration_on_this_split=fit_calibration_on_this_split,
-            calibration_fit_source=calibration_fit_source,
-            return_calibration_bundle=True,
+            train_valid_tokens=None,  # No train filtering - evaluate all tokens in data
         )
-
-        df_auc_unpooled, df_auc_merged, composite_metrics, fitted_calibration_bundle = result
-
-        if fit_calibration_on_this_split and fitted_calibration_bundle is not None:
-            shared_calibration_bundle = fitted_calibration_bundle
-            print(
-                f"[calibration] fitted on split='{split_prefix}' "
-                f"(method={shared_calibration_bundle.get('method', 'none')})"
-            )
+        
+        df_auc_unpooled_merged, df_auc_merged, composite_metrics = result
 
         if composite_metrics is None:
             composite_metrics = {}
@@ -1629,9 +1542,9 @@ def main():
                 df_auc_merged.to_parquet(f"{output_path}/{prefix}_df_both.parquet", index=False)
                 df_auc_merged.to_csv(f"{output_path}/{prefix}_df_both.csv", index=False)
             
-            if df_auc_unpooled is not None and not df_auc_unpooled.empty:
-                df_auc_unpooled.to_parquet(f"{output_path}/{prefix}_df_auc_unpooled.parquet", index=False)
-                df_auc_unpooled.to_csv(f"{output_path}/{prefix}_df_auc_unpooled.csv", index=False)
+            if df_auc_unpooled_merged is not None and not df_auc_unpooled_merged.empty:
+                df_auc_unpooled_merged.to_parquet(f"{output_path}/{prefix}_df_auc_unpooled.parquet", index=False)
+                df_auc_unpooled_merged.to_csv(f"{output_path}/{prefix}_df_auc_unpooled.csv", index=False)
             
             # Save composite metrics with prefix
             if composite_metrics:
@@ -1658,7 +1571,7 @@ def main():
         
         # Store results
         all_results[prefix] = {
-            'df_auc_unpooled': df_auc_unpooled,
+            'df_auc_unpooled': df_auc_unpooled_merged,
             'df_auc_merged': df_auc_merged,
             'composite_metrics': composite_metrics,
             'data_filename': data_filename,

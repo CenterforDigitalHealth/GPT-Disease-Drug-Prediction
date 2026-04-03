@@ -4,7 +4,7 @@ import re
 
 def get_batch_composite(ix, data, p2i, select='center', index='patient', padding='regular',
                         block_size=48, device='cpu', lifestyle_augmentations=False,
-                        no_event_token_rate=5, cut_batch=False, apply_token_shift=True,
+                        no_event_token_rate=5, cut_batch=False, apply_token_shift=False,
                         shift_continuous=False, separate_shift_na_from_padding=False, shift_na_raw_token=4,
                         dose_continuous=None, separate_dose_na_from_padding=None, dose_na_raw_token=None):
     """
