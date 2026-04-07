@@ -164,15 +164,9 @@ _pre_config_model_size = model_size
 _arch_before_configurator = {k: globals()[k] for k in MODEL_SIZE_KEYS}
 
 # Composite Delphi model config (5-column data)
-<<<<<<< HEAD
-data_vocab_size = 1290   # DATA: 약품/질병 코드 수 (Classification)
-shift_vocab_size = 5     # SHIFT: Classification (values 0-4)
-total_vocab_size = 552   # TOTAL: Embedding vocab
-=======
 data_vocab_size = 1289   # DATA: 약품/질병 코드 수 (Classification) - raw token range 2~1288
 shift_vocab_size = 4     # SHIFT: Classification (values 0-3: 0=non-drug, 1=decrease, 2=maintain, 3=increase)
 total_vocab_size = 551   # TOTAL: Embedding vocab - raw range 0~550
->>>>>>> 3053ef3 (reorg repo with final model)
 
 # SHIFT imbalance handling
 shift_loss_type = 'dice_focal'      # 'dice_focal', 'focal', 'ce'
@@ -184,13 +178,8 @@ shift_maintain_idx = 2
 shift_change_weight_max = 10.0
 shift_class_weight_cap = 8.0
 num_shift_classes = 2   # 2-class: label1(0) / label2or3(1)
-<<<<<<< HEAD
-drug_token_only_shift = False  # compute SHIFT loss only at drug token positions
-drug_token_only_total = False  # compute TOTAL loss only at drug token positions
-=======
 drug_token_only_shift = True  # compute SHIFT loss only at drug token positions
 drug_token_only_total = True  # compute TOTAL loss only at drug token positions
->>>>>>> 3053ef3 (reorg repo with final model)
 
 # TOTAL MDN settings
 mdn_n_components = 8

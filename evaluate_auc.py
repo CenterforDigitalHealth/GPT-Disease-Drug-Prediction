@@ -85,11 +85,7 @@ def get_common_diseases(labels_df, filter_min_total=100, apply_token_shift=False
                            If False (default), tokens are raw values (no shift).
 
     Returns:
-<<<<<<< HEAD
-        List of shifted token IDs (labels.csv index + 1, due to +1 shift in get_batch_composite)
-=======
         List of token IDs as used by the model.
->>>>>>> 3053ef3 (reorg repo with final model)
     """
     if 'count' in labels_df.columns:
         labels_df_filtered = labels_df[labels_df['count'] > filter_min_total]
@@ -97,50 +93,18 @@ def get_common_diseases(labels_df, filter_min_total=100, apply_token_shift=False
         # If no count column, use all non-special tokens
         # Assuming tokens 0-20 are special tokens (padding, no event, sex, lifestyle, etc.)
         labels_df_filtered = labels_df[labels_df['index'] > 20]
-<<<<<<< HEAD
-    
-    # labels.csv 'index' = raw data value
-    # get_batch_composite applies +1 shift to all DATA tokens
-    # Therefore, shifted token ID = raw data value + 1
-    raw_indices = labels_df_filtered['index'].tolist()
-    shifted_tokens = [idx + 1 for idx in raw_indices]
-    return shifted_tokens
-
-
-def finalize_token_columns(df):
-    """Make raw-vs-shifted token ids explicit in exported evaluation tables."""
-    if df is None or df.empty or 'token' not in df.columns:
-        return df
-=======
 
     raw_indices = labels_df_filtered['index'].tolist()
     if apply_token_shift:
         return [idx + 1 for idx in raw_indices]
     return raw_indices
->>>>>>> 3053ef3 (reorg repo with final model)
 
-    df = df.copy()
 
-<<<<<<< HEAD
-    if 'shifted_token' not in df.columns:
-        df['shifted_token'] = df['token']
-    # Keep `token` as a backward-compatible alias used by plotting code.
-    df['token'] = df['shifted_token']
-=======
 def get_data_token_offset(apply_token_shift: bool) -> int:
     """Return the DATA-token offset used by the model/tokenizer pipeline."""
     return 1 if apply_token_shift else 0
->>>>>>> 3053ef3 (reorg repo with final model)
 
-    if 'index' in df.columns and 'raw_token' not in df.columns:
-        df['raw_token'] = df['index']
 
-<<<<<<< HEAD
-    for col in ('token', 'shifted_token', 'index', 'raw_token'):
-        if col in df.columns:
-            df[col] = df[col].astype(np.int64)
-
-=======
 def build_labels_df_for_merge(labels_df, apply_token_shift: bool):
     """Attach the model-space DATA token id used for label merges."""
     labels_df_for_merge = labels_df.copy()
@@ -170,7 +134,6 @@ def finalize_token_columns(df):
         if col in df.columns:
             df[col] = df[col].astype(np.int64)
 
->>>>>>> 3053ef3 (reorg repo with final model)
     preferred = ['raw_token', 'shifted_token', 'token', 'name']
     ordered = [c for c in preferred if c in df.columns]
     ordered += [c for c in df.columns if c not in ordered]
@@ -697,11 +660,8 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         m = {}
         m['accuracy'] = accuracy_score(targets, preds)
         m['balanced_accuracy'] = balanced_accuracy_score(targets, preds)
-<<<<<<< HEAD
-=======
         if n_classes == 2:
             m['f1_binary'] = f1_score(targets, preds, average='binary', pos_label=1, zero_division=0)
->>>>>>> 3053ef3 (reorg repo with final model)
         m['f1_macro'] = f1_score(targets, preds, average='macro', zero_division=0)
         m['f1_micro'] = f1_score(targets, preds, average='micro', zero_division=0)
         m['f1_weighted'] = f1_score(targets, preds, average='weighted', zero_division=0)
@@ -1086,11 +1046,7 @@ def evaluate_auc_pipeline(
     # Evaluate composite fields (SHIFT, TOTAL) if composite model and enabled
     composite_metrics = None
     if evaluate_composite:
-<<<<<<< HEAD
-        print("\nEvaluating composite fields (SHIFT-binary-change, TOTAL)...")
-=======
         print("\nEvaluating composite fields (SHIFT, TOTAL)...")
->>>>>>> 3053ef3 (reorg repo with final model)
         composite_metrics = evaluate_composite_fields(
             model, d100k, batch_size=batch_size, device=device
         )
@@ -1098,122 +1054,6 @@ def evaluate_auc_pipeline(
         # Print results: drug-token subset only (same metrics as *_drug_cond); no extra section title.
         print("\nComposite Field Evaluation Results:")
         print("=" * 60)
-<<<<<<< HEAD
-        
-        # SHIFT: classification
-        if 'shift_accuracy' in composite_metrics:
-            print("SHIFT (Binary: Label1 vs Label2or3):")
-            print(f"  Accuracy: {composite_metrics['shift_accuracy']:.4f}")
-            if 'shift_balanced_accuracy' in composite_metrics:
-                print(f"  Balanced Accuracy: {composite_metrics['shift_balanced_accuracy']:.4f}")
-            if 'shift_f1_macro' in composite_metrics:
-                print(f"  F1 (macro): {composite_metrics['shift_f1_macro']:.4f}")
-            if 'shift_f1_micro' in composite_metrics:
-                print(f"  F1 (micro): {composite_metrics['shift_f1_micro']:.4f}")
-            if 'shift_f1_weighted' in composite_metrics:
-                print(f"  F1 (weighted): {composite_metrics['shift_f1_weighted']:.4f}")
-            if 'shift_precision_macro' in composite_metrics:
-                print(f"  Precision (macro): {composite_metrics['shift_precision_macro']:.4f}")
-            if 'shift_recall_macro' in composite_metrics:
-                print(f"  Recall (macro): {composite_metrics['shift_recall_macro']:.4f}")
-            if 'shift_support' in composite_metrics:
-                print(f"  Support: {composite_metrics['shift_support']}")
-            
-            # Confusion Matrix
-            if 'shift_confusion_matrix' in composite_metrics and 'shift_confusion_matrix_classes' in composite_metrics:
-                cm = np.array(composite_metrics['shift_confusion_matrix'])
-                classes = composite_metrics['shift_confusion_matrix_classes']
-                print(f"\n  Confusion Matrix:")
-                print(f"    NOTE: Classes are 0=Label1, 1=Label2or3")
-                print(f"    Predicted →")
-                # Header row with mapping
-                header = "    Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes])
-                print(header)
-                print("    " + "-" * len(header[4:]))
-                # Data rows
-                for i, cls in enumerate(classes):
-                    row_str = f"    {int(cls):>5} " + "  ".join([f"{int(cm[i, j]):>5}" for j in range(len(classes))])
-                    print(row_str)
-                
-                # Per-class metrics with mapping
-                if 'shift_per_class_metrics' in composite_metrics:
-                    print(f"\n  Per-Class Metrics:")
-                    for cls, metrics in sorted(composite_metrics['shift_per_class_metrics'].items()):
-                        print(f"    Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
-                              f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
-            
-            # Drug-conditioned SHIFT metrics (ONLY for configured drug token range)
-            if 'shift_accuracy_drug_cond' in composite_metrics:
-                shift_drug_note = composite_metrics.get('shift_drug_cond_note', 'Metrics computed only for configured drug token range')
-                print(f"\n  Drug-Conditioned ({shift_drug_note}):")
-                print(f"    Accuracy: {composite_metrics['shift_accuracy_drug_cond']:.4f}")
-                if 'shift_balanced_accuracy_drug_cond' in composite_metrics:
-                    print(f"    Balanced Accuracy: {composite_metrics['shift_balanced_accuracy_drug_cond']:.4f}")
-                if 'shift_f1_macro_drug_cond' in composite_metrics:
-                    print(f"    F1 (macro): {composite_metrics['shift_f1_macro_drug_cond']:.4f}")
-                if 'shift_f1_micro_drug_cond' in composite_metrics:
-                    print(f"    F1 (micro): {composite_metrics['shift_f1_micro_drug_cond']:.4f}")
-                if 'shift_f1_weighted_drug_cond' in composite_metrics:
-                    print(f"    F1 (weighted): {composite_metrics['shift_f1_weighted_drug_cond']:.4f}")
-                if 'shift_precision_macro_drug_cond' in composite_metrics:
-                    print(f"    Precision (macro): {composite_metrics['shift_precision_macro_drug_cond']:.4f}")
-                if 'shift_recall_macro_drug_cond' in composite_metrics:
-                    print(f"    Recall (macro): {composite_metrics['shift_recall_macro_drug_cond']:.4f}")
-                if 'shift_support_drug_cond' in composite_metrics:
-                    print(f"    Support: {composite_metrics['shift_support_drug_cond']}")
-                
-                # Drug-conditioned confusion matrix
-                if 'shift_confusion_matrix_drug_cond' in composite_metrics and 'shift_confusion_matrix_drug_cond_classes' in composite_metrics:
-                    cm_drug = np.array(composite_metrics['shift_confusion_matrix_drug_cond'])
-                    classes_drug = composite_metrics['shift_confusion_matrix_drug_cond_classes']
-                    print(f"\n    Confusion Matrix (Drug-Conditioned, Drug Tokens Only):")
-                    print(f"      NOTE: Classes are 0=Label1, 1=Label2or3")
-                    print(f"      Predicted →")
-                    header = "      Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes_drug])
-                    print(header)
-                    print("      " + "-" * len(header[6:]))
-                    for i, cls in enumerate(classes_drug):
-                        row_str = f"      {int(cls):>5} " + "  ".join([f"{int(cm_drug[i, j]):>5}" for j in range(len(classes_drug))])
-                        print(row_str)
-                    
-                    # Per-class metrics for drug-conditioned
-                    if 'shift_per_class_metrics_drug_cond' in composite_metrics:
-                        print(f"\n    Per-Class Metrics (Drug-Conditioned):")
-                        for cls, metrics in sorted(composite_metrics['shift_per_class_metrics_drug_cond'].items()):
-                            print(f"      Class {cls}: Precision={metrics['precision']:.4f}, Recall={metrics['recall']:.4f}, "
-                                  f"F1={metrics['f1']:.4f}, Support={metrics['support']}")
-        
-        # TOTAL: regression
-        field = 'total'
-        if f'{field}_mae' in composite_metrics:
-            print(f"{field.upper()}:")
-            print(f"  MAE: {composite_metrics[f'{field}_mae']:.4f}")
-            if f'{field}_rmse' in composite_metrics:
-                print(f"  RMSE: {composite_metrics[f'{field}_rmse']:.4f}")
-            if f'{field}_median_ae' in composite_metrics:
-                print(f"  Median AE: {composite_metrics[f'{field}_median_ae']:.4f}")
-            if f'{field}_r2' in composite_metrics and not np.isnan(composite_metrics[f'{field}_r2']):
-                print(f"  R²: {composite_metrics[f'{field}_r2']:.4f}")
-            if f'{field}_mae_pos' in composite_metrics:
-                print(f"  MAE (target>0): {composite_metrics[f'{field}_mae_pos']:.4f} (n={composite_metrics.get(f'{field}_support_pos', 'NA')})")
-            # TOTAL drug-conditioned extras (ONLY for configured drug token range)
-            if 'total_mae_drug_cond' in composite_metrics:
-                total_drug_note = composite_metrics.get('total_drug_cond_note', 'Metrics computed only for configured drug token range')
-                print(f"\n  Drug-Conditioned ({total_drug_note}):")
-                print(f"    MAE: {composite_metrics['total_mae_drug_cond']:.4f}")
-                if 'total_rmse_drug_cond' in composite_metrics:
-                    print(f"    RMSE: {composite_metrics['total_rmse_drug_cond']:.4f}")
-                if 'total_median_ae_drug_cond' in composite_metrics:
-                    print(f"    Median AE: {composite_metrics['total_median_ae_drug_cond']:.4f}")
-                if 'total_r2_drug_cond' in composite_metrics and not np.isnan(composite_metrics['total_r2_drug_cond']):
-                    print(f"    R²: {composite_metrics['total_r2_drug_cond']:.4f}")
-                if 'total_mean_target_drug_cond' in composite_metrics:
-                    print(f"    Mean Target: {composite_metrics['total_mean_target_drug_cond']:.4f}")
-                if 'total_mean_pred_drug_cond' in composite_metrics:
-                    print(f"    Mean Prediction: {composite_metrics['total_mean_pred_drug_cond']:.4f}")
-                if 'total_support_drug_cond' in composite_metrics:
-                    print(f"    Support: {composite_metrics['total_support_drug_cond']}")
-=======
 
         def _print_shift_summary_dc(cm_metrics: dict, prefix: str):
             """Print SHIFT summary using drug-token subset keys (*_drug_cond)."""
@@ -1285,7 +1125,6 @@ def evaluate_auc_pipeline(
                 "(No drug-token subset metrics: need use_drug_conditioning and "
                 "shift_drug_cond / total_drug_cond outputs with drug tokens in the batch.)"
             )
->>>>>>> 3053ef3 (reorg repo with final model)
         print("=" * 60)
         
         # Save composite metrics
@@ -1402,33 +1241,7 @@ def main():
         k = k.replace('module.', '').replace('_orig_mod.', '')
         cleaned[k] = v
 
-<<<<<<< HEAD
-    def infer_intermediate_size(cleaned_state_dict, use_moe):
-        if use_moe:
-            proj_key = 'h.0.mlp.experts.0.c_proj.weight'
-            fc_key = 'h.0.mlp.experts.0.c_fc.weight'
-        else:
-            proj_key = 'h.0.mlp.c_proj.weight'
-            fc_key = 'h.0.mlp.c_fc.weight'
-
-        if proj_key in cleaned_state_dict and cleaned_state_dict[proj_key].ndim == 2:
-            return int(cleaned_state_dict[proj_key].shape[1])
-        if fc_key in cleaned_state_dict and cleaned_state_dict[fc_key].ndim == 2:
-            return int(cleaned_state_dict[fc_key].shape[0] // 2)
-        return None
-
     use_moe = bool(model_args.get('use_moe', False))
-    inferred_size = infer_intermediate_size(cleaned, use_moe=use_moe)
-    if use_moe and inferred_size is not None:
-        model_args['moe_intermediate_size'] = inferred_size
-        print(f"Inferred MoE intermediate size from checkpoint: {inferred_size}")
-    elif not use_moe and inferred_size is not None:
-        model_args['ffn_intermediate_size'] = inferred_size
-        print(f"Inferred FFN intermediate size from checkpoint: {inferred_size}")
-
-=======
-    use_moe = bool(model_args.get('use_moe', False))
->>>>>>> 3053ef3 (reorg repo with final model)
     # Extract MoE and other architecture info for metadata
     num_experts = model_args.get('num_experts', 0)
     experts_per_token = model_args.get('experts_per_token', 0)
