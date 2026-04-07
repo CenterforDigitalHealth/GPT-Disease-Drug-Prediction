@@ -146,7 +146,7 @@ def gpu_worker(gpu_id, patient_indices, queue, ckpt_path, data_root, block_size,
     # Load validation dataset
     checkpoint = torch.load(ckpt_path, map_location=device)
     model_args = dict(checkpoint['model_args'])
-    eval_apply_token_shift = False  # must match get_batch_composite below
+    eval_apply_token_shift = bool(model_args.get('apply_token_shift', False))
     if 'drug_token_min' not in model_args or 'drug_token_max' not in model_args:
         model_args['drug_token_min'] = 1279 if eval_apply_token_shift else 1278
         model_args['drug_token_max'] = 1289 if eval_apply_token_shift else 1288

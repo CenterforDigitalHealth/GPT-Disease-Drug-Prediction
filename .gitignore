@@ -5,6 +5,8 @@ results/
 analyze_results.py.ipynb_checkpoints/
 figure/.ipynb_checkpoints
 figure/figutils/.ipynb_checkpoints
+figure/*.pdf
+figure/*.csv
 out/*
 .ipynb_checkpoints/*
 *.parquet
@@ -20,8 +22,13 @@ prev/
 out_dann/
 0319_1839_out/
 0319_2059_out/
+_clean/
+runtime_logs
 *_dann.py
 experiments/
 
 sampling_trajectories_.ipynb
 sampling_trajectories_v6.ipynb
+CLAUDE.md
+.claude
+requirements.txt

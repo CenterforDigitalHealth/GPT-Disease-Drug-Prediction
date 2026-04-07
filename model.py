@@ -141,7 +141,7 @@ def _apply_rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> 
 
 
 class RotaryEmbedding(nn.Module):
-    """RoPE with medical age information"""
+    """Standard RoPE over sequence positions; age is injected separately."""
     
     def __init__(
         self,
@@ -244,6 +244,8 @@ class GroupedQueryAttention(nn.Module):
 
     def forward(self, x, age=None, attn_mask=None):
         B, T, C = x.size()
+        # `age` is accepted for interface consistency. Attention itself uses
+        # sequence-position RoPE; age enters via additive AgeEncoding upstream.
         
         # Compute Q, K, V
         q = self.q_proj(x)  # (B, T, n_embd)
@@ -255,7 +257,7 @@ class GroupedQueryAttention(nn.Module):
         k = k.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # (B, n_kv_head, T, head_dim)
         v = v.view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)  # (B, n_kv_head, T, head_dim)
         
-        # Apply RoPE
+        # Apply standard sequence-position RoPE (not age-aware RoPE)
         cos, sin = self.rope(x, T)
         q_shape = q.shape
         k_shape = k.shape
@@ -291,7 +293,7 @@ class GroupedQueryAttention(nn.Module):
                 window_mask = torch.tril(torch.ones(T, T, device=x.device), diagonal=-self.sliding_window).bool()
                 att = att.masked_fill(window_mask.view(1, 1, T, T), float('-inf'))
             
-            # Custom medical attention mask
+            # Optional externally supplied mask (e.g. padding / tie masking)
             if attn_mask is not None:
                 att = att.masked_fill(attn_mask == 0, float('-inf'))
             
@@ -331,7 +333,11 @@ class MixtureOfExperts(nn.Module):
         self.num_experts = config.num_experts if hasattr(config, 'num_experts') else 4
         self.experts_per_token = config.experts_per_token if hasattr(config, 'experts_per_token') else 2
         self.n_embd = config.n_embd
+<<<<<<< HEAD
         self.intermediate_size = int(getattr(config, 'moe_intermediate_size', 0) or (2 * config.n_embd))
+=======
+        self.intermediate_size = 2 * config.n_embd
+>>>>>>> 3053ef3 (reorg repo with final model)
 
         # Router
         self.gate = nn.Linear(config.n_embd, self.num_experts, bias=False)
@@ -405,7 +411,11 @@ class TransformerFFN(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.n_embd = config.n_embd
+<<<<<<< HEAD
         self.intermediate_size = int(getattr(config, 'ffn_intermediate_size', 0) or (2 * config.n_embd))
+=======
+        self.intermediate_size = 2 * config.n_embd
+>>>>>>> 3053ef3 (reorg repo with final model)
         
         self.c_fc = nn.Linear(config.n_embd, 2 * self.intermediate_size, bias=config.bias)
         self.c_proj = nn.Linear(self.intermediate_size, config.n_embd, bias=config.bias)
@@ -800,6 +810,7 @@ class CompositeDelphiConfig:
     # Vocabulary sizes for each field
     #
     # Token space convention: apply_token_shift=False (raw tokens, 0 reserved for padding via clamp_min).
+<<<<<<< HEAD
     # - DATA: raw 0-1288. Drug tokens: Metformin(1278)..Death(1288). vocab_size=1290.
     # - SHIFT: raw 0-4. Values 1=decrease, 2=maintain, 3=increase, 0=padding, 4=NA.
     # - TOTAL: raw 0-550. vocab_size=552 (embedding input only).
@@ -813,6 +824,21 @@ class CompositeDelphiConfig:
     # The SHIFT classification head output size is controlled by num_shift_classes.
     shift_vocab_size: int = 5
     total_vocab_size: int = 552   # TOTAL embedding only — raw range 0-550, 0 doubles as padding
+=======
+    # - DATA: raw 2-1288. Drug tokens: Metformin(1278)..Death(1288). vocab_size=1289.
+    # - SHIFT: raw 0-3. Values 0=non-drug, 1=decrease, 2=maintain, 3=increase.
+    # - TOTAL: raw 0-550. vocab_size=551 (embedding input only).
+    #
+    # Head outputs:
+    # - DATA Head: Linear(n_embd, 1289) → Cross-Entropy (Classification)
+    # - SHIFT Head: ShiftClassificationHead → num_shift_classes logits (default 3: dec/maint/inc)
+    # - TOTAL Head: MixtureDensityHead → MDN NLL (Regression, continuous)
+    data_vocab_size: int = 1289   # DATA embedding & head — max raw token 1288 (Death)
+    # NOTE: shift_vocab_size is used for SHIFT embedding input space only.
+    # The SHIFT classification head output size is controlled by num_shift_classes.
+    shift_vocab_size: int = 4     # SHIFT raw range 0-3
+    total_vocab_size: int = 551   # TOTAL embedding only — raw range 0-550
+>>>>>>> 3053ef3 (reorg repo with final model)
     
     # Model architecture
     n_layer: int = 12
@@ -845,8 +871,11 @@ class CompositeDelphiConfig:
     use_moe: bool = True
     num_experts: int = 4
     experts_per_token: int = 2
+<<<<<<< HEAD
     moe_intermediate_size: int = 0  # 0 => derive from current default (2 * n_embd)
     ffn_intermediate_size: int = 0  # 0 => derive from current default (2 * n_embd)
+=======
+>>>>>>> 3053ef3 (reorg repo with final model)
     sliding_window: int = 512
     rope_theta: float = 10000.0
 
@@ -981,7 +1010,7 @@ class CompositeDelphi(nn.Module):
         # 1. Composite Embedding
         composite_emb = self.composite_emb(data, shift, total)
         
-        # 2. Age Encoding
+        # 2. Age encoding is added to the hidden states before attention blocks.
         age_emb = self.age_encoding(age)
         
         # 3. Combine embeddings
@@ -989,7 +1018,8 @@ class CompositeDelphi(nn.Module):
         x = x + age_emb
         x = self.drop(x)
         
-        # 4. Attention mask
+        # 4. Build an attention mask. This can enforce age-based exclusions,
+        # but attention scores themselves are still standard RoPE attention.
         attn_mask = (data > 0).view(b, 1, 1, t) * (data > 0).view(b, 1, t, 1)
         attn_mask *= torch.tril(torch.ones(t, t, device=device))[None, None, :, :] > 0
         
@@ -1516,7 +1546,14 @@ class CompositeDelphi(nn.Module):
                 }
             
             # Sample shift, total from their distributions
+<<<<<<< HEAD
             shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True)
+=======
+            # SHIFT head logits are class indices; convert them back to the
+            # dataset token values before autoregressive feedback.
+            shift_next = torch.argmax(shift_logits, dim=-1, keepdim=True).long()
+            shift_next += 2 if bool(getattr(self.config, 'apply_token_shift', False)) else 1
+>>>>>>> 3053ef3 (reorg repo with final model)
             
             # TOTAL generation:
             # - Prefer MDN sampling (component sampling + logistic sampling)

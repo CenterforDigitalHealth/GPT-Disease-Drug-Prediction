@@ -73,16 +73,23 @@ def auc(x1, x2):
     return U1 / n1 / n2
 
 
-def get_common_diseases(labels_df, filter_min_total=100):
+def get_common_diseases(labels_df, filter_min_total=100, apply_token_shift=False):
     """
     Get common diseases from labels DataFrame.
-    
+
     Args:
         labels_df: DataFrame with columns including 'index' and optionally 'count'
         filter_min_total: Minimum count to include a token
-    
+        apply_token_shift: If True, get_batch_composite adds +1 to all DATA tokens,
+                           so returned token IDs = raw index + 1.
+                           If False (default), tokens are raw values (no shift).
+
     Returns:
+<<<<<<< HEAD
         List of shifted token IDs (labels.csv index + 1, due to +1 shift in get_batch_composite)
+=======
+        List of token IDs as used by the model.
+>>>>>>> 3053ef3 (reorg repo with final model)
     """
     if 'count' in labels_df.columns:
         labels_df_filtered = labels_df[labels_df['count'] > filter_min_total]
@@ -90,6 +97,7 @@ def get_common_diseases(labels_df, filter_min_total=100):
         # If no count column, use all non-special tokens
         # Assuming tokens 0-20 are special tokens (padding, no event, sex, lifestyle, etc.)
         labels_df_filtered = labels_df[labels_df['index'] > 20]
+<<<<<<< HEAD
     
     # labels.csv 'index' = raw data value
     # get_batch_composite applies +1 shift to all DATA tokens
@@ -97,6 +105,50 @@ def get_common_diseases(labels_df, filter_min_total=100):
     raw_indices = labels_df_filtered['index'].tolist()
     shifted_tokens = [idx + 1 for idx in raw_indices]
     return shifted_tokens
+
+
+def finalize_token_columns(df):
+    """Make raw-vs-shifted token ids explicit in exported evaluation tables."""
+    if df is None or df.empty or 'token' not in df.columns:
+        return df
+=======
+
+    raw_indices = labels_df_filtered['index'].tolist()
+    if apply_token_shift:
+        return [idx + 1 for idx in raw_indices]
+    return raw_indices
+>>>>>>> 3053ef3 (reorg repo with final model)
+
+    df = df.copy()
+
+<<<<<<< HEAD
+    if 'shifted_token' not in df.columns:
+        df['shifted_token'] = df['token']
+    # Keep `token` as a backward-compatible alias used by plotting code.
+    df['token'] = df['shifted_token']
+=======
+def get_data_token_offset(apply_token_shift: bool) -> int:
+    """Return the DATA-token offset used by the model/tokenizer pipeline."""
+    return 1 if apply_token_shift else 0
+>>>>>>> 3053ef3 (reorg repo with final model)
+
+    if 'index' in df.columns and 'raw_token' not in df.columns:
+        df['raw_token'] = df['index']
+
+<<<<<<< HEAD
+    for col in ('token', 'shifted_token', 'index', 'raw_token'):
+        if col in df.columns:
+            df[col] = df[col].astype(np.int64)
+
+=======
+def build_labels_df_for_merge(labels_df, apply_token_shift: bool):
+    """Attach the model-space DATA token id used for label merges."""
+    labels_df_for_merge = labels_df.copy()
+    if 'index' in labels_df_for_merge.columns:
+        labels_df_for_merge['shifted_token'] = (
+            labels_df_for_merge['index'] + get_data_token_offset(apply_token_shift)
+        )
+    return labels_df_for_merge
 
 
 def finalize_token_columns(df):
@@ -118,6 +170,7 @@ def finalize_token_columns(df):
         if col in df.columns:
             df[col] = df[col].astype(np.int64)
 
+>>>>>>> 3053ef3 (reorg repo with final model)
     preferred = ['raw_token', 'shifted_token', 'token', 'name']
     ordered = [c for c in preferred if c in df.columns]
     ordered += [c for c in df.columns if c not in ordered]
@@ -644,6 +697,11 @@ def evaluate_composite_fields(model, d100k, batch_size=64, device="mps"):
         m = {}
         m['accuracy'] = accuracy_score(targets, preds)
         m['balanced_accuracy'] = balanced_accuracy_score(targets, preds)
+<<<<<<< HEAD
+=======
+        if n_classes == 2:
+            m['f1_binary'] = f1_score(targets, preds, average='binary', pos_label=1, zero_division=0)
+>>>>>>> 3053ef3 (reorg repo with final model)
         m['f1_macro'] = f1_score(targets, preds, average='macro', zero_division=0)
         m['f1_micro'] = f1_score(targets, preds, average='micro', zero_division=0)
         m['f1_weighted'] = f1_score(targets, preds, average='weighted', zero_division=0)
@@ -837,8 +895,9 @@ def evaluate_auc_pipeline(
             print(f"         Tokens with index >= {vocab_size} will be excluded from evaluation.")
     
     # Get common diseases
+    _apply_token_shift = bool(getattr(model.config, 'apply_token_shift', False))
     if diseases_of_interest is None:
-        diseases_of_interest = get_common_diseases(labels_df, filter_min_total)
+        diseases_of_interest = get_common_diseases(labels_df, filter_min_total, apply_token_shift=_apply_token_shift)
     
     # Filter out invalid indices (must be < vocab_size)
     # Note: token indices are 0-based, so valid range is [0, vocab_size)
@@ -968,9 +1027,8 @@ def evaluate_auc_pipeline(
         labels_df_subset = labels_df[['index']].copy()
         if 'name' in labels_df.columns:
             labels_df_subset['name'] = labels_df['name']
-        # labels.csv 'index' = raw data value, but df_auc_unpooled 'token' = shifted token ID
-        # Therefore, create shifted_token column for merge
-        labels_df_subset['shifted_token'] = labels_df_subset['index'] + 1
+        _apply_shift = bool(getattr(model.config, 'apply_token_shift', False))
+        labels_df_subset = build_labels_df_for_merge(labels_df_subset, _apply_shift)
         df_auc_unpooled_merged = df_auc_unpooled.merge(
             labels_df_subset, left_on="token", right_on="shifted_token", how="inner"
         )
@@ -1018,10 +1076,8 @@ def evaluate_auc_pipeline(
     df_auc = df_auc_unpooled.groupby(["token"]).apply(aggregate_age_brackets_delong, include_groups=False).reset_index()
     
     if 'index' in labels_df.columns:
-        # labels.csv 'index' = raw data value, but df_auc 'token' = shifted token ID
-        # Create temporary shifted_token column for merge
-        labels_df_for_merge = labels_df.copy()
-        labels_df_for_merge['shifted_token'] = labels_df_for_merge['index'] + 1
+        _apply_shift = bool(getattr(model.config, 'apply_token_shift', False))
+        labels_df_for_merge = build_labels_df_for_merge(labels_df, _apply_shift)
         df_auc_merged = df_auc.merge(labels_df_for_merge, left_on="token", right_on="shifted_token", how="inner")
     else:
         df_auc_merged = df_auc.copy()
@@ -1030,14 +1086,19 @@ def evaluate_auc_pipeline(
     # Evaluate composite fields (SHIFT, TOTAL) if composite model and enabled
     composite_metrics = None
     if evaluate_composite:
+<<<<<<< HEAD
         print("\nEvaluating composite fields (SHIFT-binary-change, TOTAL)...")
+=======
+        print("\nEvaluating composite fields (SHIFT, TOTAL)...")
+>>>>>>> 3053ef3 (reorg repo with final model)
         composite_metrics = evaluate_composite_fields(
             model, d100k, batch_size=batch_size, device=device
         )
         
-        # Print results
+        # Print results: drug-token subset only (same metrics as *_drug_cond); no extra section title.
         print("\nComposite Field Evaluation Results:")
         print("=" * 60)
+<<<<<<< HEAD
         
         # SHIFT: classification
         if 'shift_accuracy' in composite_metrics:
@@ -1152,6 +1213,79 @@ def evaluate_auc_pipeline(
                     print(f"    Mean Prediction: {composite_metrics['total_mean_pred_drug_cond']:.4f}")
                 if 'total_support_drug_cond' in composite_metrics:
                     print(f"    Support: {composite_metrics['total_support_drug_cond']}")
+=======
+
+        def _print_shift_summary_dc(cm_metrics: dict, prefix: str):
+            """Print SHIFT summary using drug-token subset keys (*_drug_cond)."""
+            acc_k = f'{prefix}shift_accuracy_drug_cond'
+            if acc_k not in cm_metrics:
+                return False
+            print("SHIFT (Binary: Label1 vs Label2or3):")
+            print(f"  Accuracy: {cm_metrics[acc_k]:.4f}")
+            bak = f'{prefix}shift_balanced_accuracy_drug_cond'
+            if bak in cm_metrics:
+                print(f"  Balanced Accuracy: {cm_metrics[bak]:.4f}")
+            auc_k = f'{prefix}shift_roc_auc_drug_cond'
+            if auc_k in cm_metrics:
+                auc_v = cm_metrics[auc_k]
+                if auc_v is not None and not (isinstance(auc_v, float) and np.isnan(auc_v)):
+                    print(f"  AUC: {float(auc_v):.4f}")
+            f1b_k = f'{prefix}shift_f1_binary_drug_cond'
+            if f1b_k in cm_metrics:
+                print(f"  F1: {cm_metrics[f1b_k]:.4f}")
+            sup_k = f'{prefix}shift_support_drug_cond'
+            if sup_k in cm_metrics:
+                print(f"  Support: {cm_metrics[sup_k]}")
+            cm_key = f'{prefix}shift_confusion_matrix_drug_cond'
+            cm_cls_key = f'{prefix}shift_confusion_matrix_drug_cond_classes'
+            if cm_key in cm_metrics and cm_cls_key in cm_metrics:
+                cm_drug = np.array(cm_metrics[cm_key])
+                classes_drug = cm_metrics[cm_cls_key]
+                print("\n  Confusion Matrix:")
+                print("    NOTE: Classes are 0=Label1, 1=Label2or3")
+                print("    Predicted →")
+                header = "    Actual ↓   " + "  ".join([f"{int(c):>5}" for c in classes_drug])
+                print(header)
+                print("    " + "-" * len(header[4:]))
+                for i, cls in enumerate(classes_drug):
+                    row_str = f"    {int(cls):>5} " + "  ".join(
+                        [f"{int(cm_drug[i, j]):>5}" for j in range(len(classes_drug))]
+                    )
+                    print(row_str)
+            pcm_key = f'{prefix}shift_per_class_metrics_drug_cond'
+            if pcm_key in cm_metrics:
+                print("\n  Per-Class Metrics:")
+                for cls, metrics in sorted(cm_metrics[pcm_key].items()):
+                    print(
+                        f"    Class {cls}: Precision={metrics['precision']:.4f}, "
+                        f"Recall={metrics['recall']:.4f}, F1={metrics['f1']:.4f}, "
+                        f"Support={metrics['support']}"
+                    )
+            return True
+
+        def _print_total_summary_dc(cm_metrics: dict, prefix: str):
+            mae_k = f'{prefix}total_mae_drug_cond'
+            if mae_k not in cm_metrics:
+                return False
+            print("TOTAL:")
+            print(f"  MAE: {cm_metrics[mae_k]:.4f}")
+            if f'{prefix}total_rmse_drug_cond' in cm_metrics:
+                print(f"  RMSE: {cm_metrics[f'{prefix}total_rmse_drug_cond']:.4f}")
+            r2_k = f'{prefix}total_r2_drug_cond'
+            if r2_k in cm_metrics and not np.isnan(cm_metrics[r2_k]):
+                print(f"  R²: {cm_metrics[r2_k]:.4f}")
+            return True
+
+        printed_shift = _print_shift_summary_dc(composite_metrics, "")
+        if printed_shift:
+            print()
+        printed_total = _print_total_summary_dc(composite_metrics, "")
+        if not (printed_shift or printed_total):
+            print(
+                "(No drug-token subset metrics: need use_drug_conditioning and "
+                "shift_drug_cond / total_drug_cond outputs with drug tokens in the batch.)"
+            )
+>>>>>>> 3053ef3 (reorg repo with final model)
         print("=" * 60)
         
         # Save composite metrics
@@ -1268,6 +1402,7 @@ def main():
         k = k.replace('module.', '').replace('_orig_mod.', '')
         cleaned[k] = v
 
+<<<<<<< HEAD
     def infer_intermediate_size(cleaned_state_dict, use_moe):
         if use_moe:
             proj_key = 'h.0.mlp.experts.0.c_proj.weight'
@@ -1291,6 +1426,9 @@ def main():
         model_args['ffn_intermediate_size'] = inferred_size
         print(f"Inferred FFN intermediate size from checkpoint: {inferred_size}")
 
+=======
+    use_moe = bool(model_args.get('use_moe', False))
+>>>>>>> 3053ef3 (reorg repo with final model)
     # Extract MoE and other architecture info for metadata
     num_experts = model_args.get('num_experts', 0)
     experts_per_token = model_args.get('experts_per_token', 0)
